@@ -17,6 +17,7 @@ It can't submit, post, or change anything in Canvas. Every tool only reads.
 | `list_pages` / `get_page` | Notes and pages the teacher wrote in Canvas |
 | `list_files` / `read_file` | Reads **PDF, DOCX, PPTX (with speaker notes), HTML, text/code**. Long files come back in chunks. |
 | `list_announcements` | Recent announcements ("test moved to Tuesday") |
+| `get_calendar` | Course calendar for any date range: daily lesson topics, test days, and optionally due dates ("what did we do Tuesday?", "what's been covered since the last test?") |
 | `list_discussions` / `get_discussion` | Discussion prompts and replies |
 | `list_quizzes` | Quiz/test dates, number of questions, time limits |
 | `search_course` | Finds modules, pages, files, and assignments matching a topic |

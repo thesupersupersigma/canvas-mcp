@@ -16,7 +16,14 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
     return new Date(iso).toLocaleString("en-US", {
       timeZone: opts.timeZone, weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
     });
-  };
+  };  const fmtDay = (iso: string) =>
+    new Date(iso).toLocaleDateString("en-US", { timeZone: opts.timeZone, weekday: "short", month: "short", day: "numeric" }) + " (all day)";
+  const isLocalMidnight = (iso: string) =>
+    new Date(iso).toLocaleTimeString("en-US", { timeZone: opts.timeZone, hour12: false, hour: "2-digit", minute: "2-digit" }).replace(/^24/, "00") === "00:00";
+  // Calendar "events" with no real time (lesson topics, test days) come through as midnight; show them as all-day.
+  const fmtWhen = (iso: string | null | undefined, allDay?: boolean, isEvent?: boolean) =>
+    !iso ? null : allDay || (isEvent && isLocalMidnight(iso)) ? fmtDay(iso) : fmt(iso);
+
   const ok = (data: unknown) => ({
     content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 1) }],
   });
@@ -85,7 +92,7 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
         i.plannable_type === "calendar_event" || i.plannable_type === "announcement" ? undefined : "not submitted";
       return {
         type: i.plannable_type, title: i.plannable?.title, course: i.context_name, course_id: i.course_id,
-        due: fmt(i.plannable_date), points: i.plannable?.points_possible, status,
+        due: fmtWhen(i.plannable_date, i.plannable?.all_day, i.plannable_type === "calendar_event"), points: i.plannable?.points_possible, status,
         id: i.plannable_id, assignment_id: i.plannable?.assignment_id,
       };
     });
@@ -330,6 +337,66 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
       time_limit_min: x.time_limit, attempts: x.allowed_attempts, type: x.quiz_type,
       description: htmlToText(x.description, 1500) || undefined,
     }));
+  }));
+
+  // ---------- Calendar ----------
+  server.registerTool("get_calendar", {
+    title: "Course calendar",
+    description:
+      "The course calendar for any date range, past or future: calendar events (teachers often post one per day with the lesson " +
+      "topic, e.g. '4.2 Factoring By Grouping', plus test days and no-school days) and optionally assignment due dates. " +
+      "Use it to answer 'what did we do on Tuesday', 'what have we covered since the last test', 'when was X taught', " +
+      "or to work out which lessons a test covers before making a study guide.",
+    inputSchema: {
+      course_id: courseId.optional().describe("Omit for all active courses"),
+      start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("YYYY-MM-DD, default 30 days ago"),
+      end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe("YYYY-MM-DD inclusive, default 14 days from now"),
+      search: z.string().optional().describe("Only items whose title contains this text, e.g. 'test', 'quiz', '4.2'"),
+      include_assignments: z.boolean().default(false).describe("Also list assignment due dates (otherwise events only)"),
+    },
+    annotations: ro,
+  }, safe(async ({ course_id, start_date, end_date, search, include_assignments }) => {
+    const day = (offset: number) => new Date(Date.now() + offset * 864e5).toLocaleDateString("en-CA", { timeZone: opts.timeZone });
+    const start = start_date ?? day(-30);
+    // Canvas end_date is exclusive, so push it one day forward to make it inclusive.
+    const endExclusive = new Date(new Date((end_date ?? day(14)) + "T12:00:00Z").getTime() + 864e5).toISOString().slice(0, 10);
+
+    const courses = (await canvas.getAll("/courses", { enrollment_state: "active" })).filter((c: any) => c.name);
+    const names = new Map<string, string>(courses.map((c: any) => [`course_${c.id}`, c.name]));
+    const codes = course_id ? [`course_${course_id}`] : [...names.keys()];
+    if (!codes.length) return [];
+
+    const types = include_assignments ? ["event", "assignment"] : ["event"];
+    const batches: any[][] = [];
+    for (const type of types)
+      for (let i = 0; i < codes.length; i += 10) // Canvas accepts at most 10 context codes per request
+        batches.push(await canvas.getAll("/calendar_events", {
+          type, context_codes: codes.slice(i, i + 10), start_date: start, end_date: endExclusive,
+        }));
+
+    const q = search?.toLowerCase();
+    const seen = new Set<string>(); // teachers often post the same event once per section
+    return batches.flat()
+      .filter((e: any) => !q || e.title?.toLowerCase().includes(q))
+      .sort((a: any, b: any) => String(a.start_at).localeCompare(String(b.start_at)))
+      .map((e: any) => {
+        const isAssignment = !!e.assignment;
+        return {
+          when: isAssignment ? fmt(e.assignment.due_at ?? e.start_at) : fmtWhen(e.start_at, e.all_day, true),
+          type: isAssignment ? "assignment due" : "event",
+          course: names.get(e.context_code) ?? e.context_name ?? e.context_code,
+          title: e.title,
+          details: htmlToText(e.description, 600) || undefined,
+          location: e.location_name || undefined,
+          assignment_id: isAssignment ? e.assignment.id : undefined,
+        };
+      })
+      .filter((x: any) => {
+        const key = `${x.when}|${x.course}|${x.details ?? x.title.replace(/\s*\([^)]*\)\s*$/, "")}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
   }));
 
   // ---------- Search ----------
