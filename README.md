@@ -48,7 +48,7 @@ CANVAS_BASE_URL=https://yourschool.instructure.com CANVAS_API_TOKEN=xxxx npm run
 $env:CANVAS_BASE_URL="https://yourschool.instructure.com"; $env:CANVAS_API_TOKEN="xxxx"; npm run check
 ```
 
-If the check passes, it prints your name and your active courses. A 401 error means the token is wrong or expired. You can make a new one under Canvas → Account → Settings → Approved Integrations → **+ New Access Token**.
+If the check passes, it prints your Canvas user id and your active courses. A 401 error means the token is wrong or expired. You can make a new one under Canvas → Account → Settings → Approved Integrations → **+ New Access Token**.
 
 ## Step 3: Connect it to Claude
 
@@ -90,11 +90,11 @@ On macOS, use a path like `/Users/you/canvas-mcp/dist/index.js`. Restart Claude 
 HTTP mode serves MCP at `https://your-host/mcp/<MCP_SECRET>`. claude.ai's servers connect to that URL directly, so it has to be reachable from the public internet.
 
 1. Generate a secret: `openssl rand -hex 24`
-2. Deploy the included `Dockerfile` (Coolify: *New Resource → Dockerfile*, or any Docker host). Set these env vars: `CANVAS_BASE_URL`, `CANVAS_API_TOKEN`, `CANVAS_TZ`, `MCP_SECRET`. The container listens on port 3000 and has `/health` for health checks.
+2. Deploy the included `Dockerfile` (Coolify: *New Resource → Dockerfile*, or any Docker host). Set these env vars: `CANVAS_BASE_URL`, `CANVAS_API_TOKEN`, `CANVAS_TZ`, `MCP_SECRET`. The container listens on port 7341 and has `/health` for health checks.
 3. Expose it on a subdomain, for example `canvas-mcp.yourdomain.com`, through your reverse proxy or Cloudflare Tunnel. **Don't put it behind Cloudflare Access or Basic Auth.** claude.ai can't log in through those, so the secret path is the protection instead.
 4. In claude.ai, go to Settings → Connectors, add a custom connector, and paste `https://canvas-mcp.yourdomain.com/mcp/<MCP_SECRET>`.
 
-Without Docker: `node dist/index.js --http --port 3000` (it reads the same env vars).
+Without Docker: `node dist/index.js --http` (it reads the same env vars). It binds to 127.0.0.1 by default, so only this machine can reach it; add `--host 0.0.0.0` when a proxy on another machine needs to reach it.
 
 > ⚠️ Anyone who has the full URL can read your Canvas through it. Treat the URL like a password. If it leaks, change `MCP_SECRET`, and also revoke the token in Canvas if you're unsure.
 
@@ -115,7 +115,7 @@ Example requests:
 
 ```
 canvas-mcp [--url URL] [--token T] [--tz ZONE] [--max-chars N]   stdio mode (default)
-canvas-mcp --http [--port 3000] [--host 0.0.0.0] [--secret S]      HTTP mode
+canvas-mcp --http [--port 7341] [--host 127.0.0.1] [--secret S]    HTTP mode
 canvas-mcp --check                                                  test credentials
 canvas-mcp --help | --version
 ```
@@ -127,7 +127,7 @@ canvas-mcp --help | --version
 | `CANVAS_TZ` | `--tz` | system time zone |
 | `CANVAS_MAX_CHARS` | `--max-chars` | 20000 characters per response chunk |
 | `MCP_SECRET` | `--secret` | (required for `--http`, minimum 24 chars) |
-| `PORT` / `HOST` | `--port` / `--host` | 3000 / 0.0.0.0 |
+| `CANVAS_MCP_PORT` / `CANVAS_MCP_HOST` | `--port` / `--host` | 7341 / 127.0.0.1 (Docker image uses 0.0.0.0) |
 
 ## Limitations
 

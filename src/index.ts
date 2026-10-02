@@ -23,8 +23,8 @@ Options (each also settable by env var):
   --tz <zone>          Time zone for due dates (default: system)               [CANVAS_TZ]
   --max-chars <n>      Max characters per tool response chunk (default 20000) [CANVAS_MAX_CHARS]
   --http               Serve MCP over Streamable HTTP instead of stdio
-  --port <n>           HTTP port (default 3000)                               [PORT]
-  --host <addr>        HTTP bind address (default 0.0.0.0)                    [HOST]
+  --port <n>           HTTP port (default 7341)                               [CANVAS_MCP_PORT]
+  --host <addr>        HTTP bind address (default 127.0.0.1 = this PC only)   [CANVAS_MCP_HOST]
   --secret <s>         Required in HTTP mode: endpoint becomes /mcp/<secret>  [MCP_SECRET]
   --check              Verify credentials and exit
   -v, --version
@@ -73,7 +73,7 @@ function buildServer() {
 async function check() {
   const me = await canvas.get("/users/self");
   const courses = await canvas.getAll("/courses", { enrollment_state: "active" });
-  console.log(`✓ Authenticated as ${me.name} (id ${me.id})`);
+  console.log(`✓ Authenticated (Canvas user id ${me.id})`);
   console.log(`✓ ${courses.length} active course(s):`);
   for (const c of courses) if (c.name) console.log(`   ${c.id}  ${c.name}`);
 }
@@ -86,8 +86,8 @@ async function stdio() {
 async function http() {
   const secret = a.secret ?? env.MCP_SECRET;
   if (!secret || secret.length < 24) die("HTTP mode needs --secret / MCP_SECRET of at least 24 chars (try: openssl rand -hex 24)");
-  const port = Number(a.port ?? env.PORT ?? 3000);
-  const host = a.host ?? env.HOST ?? "0.0.0.0";
+  const port = Number(a.port ?? env.CANVAS_MCP_PORT ?? 7341);
+  const host = a.host ?? env.CANVAS_MCP_HOST ?? "127.0.0.1";
   const expected = Buffer.from(`/mcp/${secret}`);
 
   const readBody = (req: IncomingMessage) =>
