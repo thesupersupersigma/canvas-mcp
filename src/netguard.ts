@@ -86,26 +86,44 @@ function deadline(ms: number, outer?: AbortSignal | null) {
 
 const NULL_BODY = new Set([101, 204, 205, 304]);
 
+/** Fetch's reason-phrase (HTAB, SP, VCHAR, obs-text), which the Response constructor insists on. undici decodes the
+ *  server's phrase as UTF-8, so "€", U+FFFD or a control byte comes through and would make the constructor throw. */
+const REASON_PHRASE = /^[\t\x20-\x7e\x80-\xff]*$/;
+
 /** The final response, re-wrapped so its decoded body errors with NetGuardError past `max` bytes and stops at the
- *  deadline. undici's maxResponseSize only counts wire bytes, and a small gzip body can inflate to gigabytes. */
+ *  deadline. undici's maxResponseSize only counts wire bytes, and a small gzip body can inflate to gigabytes.
+ *  Any throw in here cancels the source body: the caller's catch then clears the deadline, and nothing else
+ *  would release the socket (undici's bodyTimeout never fires while its parser is paused on backpressure). */
 function capBody(res: Response, max: number, signal: AbortSignal, done: () => void): Response {
-  if (res.status < 200 || res.status > 599) { // undici passes 600-999 through, but a Response can't carry them
+  try {
+    // undici passes 600-999 through, but a Response can't carry them.
+    if (res.status < 200 || res.status > 599) throw new NetGuardError(`Unexpected HTTP status ${res.status}`);
+    if (!res.body || NULL_BODY.has(res.status)) { done(); return res; }
+    let seen = 0;
+    const counter = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if ((seen += chunk.byteLength) > max) throw new NetGuardError(`Response body is over ${max / 1048576} MB`);
+        controller.enqueue(chunk);
+      },
+    });
+    // The reason phrase is cosmetic, so a bad one is dropped. Other headers the server sent that Headers refuses
+    // (undici's parser lets some through, such as a name with a space in it) make the response malformed.
+    const statusText = REASON_PHRASE.test(res.statusText) ? res.statusText : "";
+    let capped: Response;
+    try {
+      capped = new Response(counter.readable, { status: res.status, statusText, headers: res.headers });
+    } catch (e) {
+      throw new NetGuardError("Malformed HTTP response", { cause: e });
+    }
+    Object.defineProperty(capped, "url", { value: res.url });
+    // Start reading only once nothing above can throw. From here on, erroring or cancelling either end tears down
+    // the other, and the deadline aborts the pipe, so the source socket is released either way.
+    res.body.pipeTo(counter.writable, { signal }).catch(() => {}).finally(done);
+    return capped;
+  } catch (e) {
     res.body?.cancel().catch(() => {});
-    throw new NetGuardError(`Unexpected HTTP status ${res.status}`);
+    throw e;
   }
-  if (!res.body || NULL_BODY.has(res.status)) { done(); return res; }
-  let seen = 0;
-  const counter = new TransformStream<Uint8Array, Uint8Array>({
-    transform(chunk, controller) {
-      if ((seen += chunk.byteLength) > max) throw new NetGuardError(`Response body is over ${max / 1048576} MB`);
-      controller.enqueue(chunk);
-    },
-  });
-  // Erroring or cancelling either end tears down the other, so the source socket is released either way.
-  res.body.pipeTo(counter.writable, { signal }).catch(() => {}).finally(done);
-  const capped = new Response(counter.readable, { status: res.status, statusText: res.statusText, headers: res.headers });
-  Object.defineProperty(capped, "url", { value: res.url });
-  return capped;
 }
 
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);

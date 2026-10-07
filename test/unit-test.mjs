@@ -185,6 +185,20 @@ section("netguard", async () => {
     await assert.rejects(Promise.race([slow.arrayBuffer(), giveUp]), { name: "NetGuardError", message: "No complete response within 0.1 s" });
     assert.ok(cancelled, "source body cancelled at the deadline");
   } finally { clearInterval(drip); clearTimeout(giveUpTimer); }
+
+  // The re-wrap can't fail after the body is in flight: a reason phrase the Response constructor rejects is dropped,
+  // and any other construction failure cancels the source and surfaces as NetGuardError.
+  let srcCancelled = 0;
+  const body = (close) => new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode("ok")); if (close) c.close(); }, cancel() { srcCancelled++; } });
+  const odd = (statusText, headers = [], close = true) => () => ({ status: 200, statusText, headers, url: "https://a.example/", body: body(close) });
+  for (const reason of ["€", "\u0001", "A\u0000B", "�", "\u007f"]) {
+    const r = await withUrlGuard(fake({ "https://a.example/": odd(reason) }))("https://a.example/");
+    assert.deepEqual([r.status, r.statusText, await r.text()], [200, "", "ok"], `reason phrase ${JSON.stringify(reason)} dropped`);
+  }
+  assert.equal((await withUrlGuard(fake({ "https://a.example/": odd("Café\tOK") }))("https://a.example/")).statusText, "Café\tOK", "valid reason phrase kept");
+  await assert.rejects(withUrlGuard(fake({ "https://a.example/": odd("OK", [["bad name", "x"]], false) }))("https://a.example/"),
+    { name: "NetGuardError", message: "Malformed HTTP response" });
+  assert.equal(srcCancelled, 1, "source body cancelled when the re-wrap fails");
 });
 
 section("netguard limits", async () => {
@@ -196,10 +210,18 @@ section("netguard limits", async () => {
   // everything else is the real stack: undici's Agent with our options, its gzip decoding, and the guard.
   const gz = (n) => zlib.gzipSync(Buffer.alloc(n));
   const gzipped = { "/1mib.gz": gz(MiB), "/2mib.gz": gz(2 * MiB), "/60mib-plus-1.gz": gz(60 * MiB + 1) };
+  // Reason phrases undici passes through (decoded as UTF-8) but the Response constructor refuses, plus one it accepts.
+  const REASONS = { euro: [0xe2, 0x82, 0xac], ctl: [0x01], nul: [0x41, 0x00, 0x42], lone: [0xe9], cafe: [...Buffer.from("Café")] };
+  const rawHead = (statusLine, ...lines) => Buffer.concat([Buffer.from("HTTP/1.1 "), Buffer.from(statusLine), ...lines.map((l) => Buffer.from(`\r\n${l}`)), Buffer.from("\r\n\r\n")]);
   let seen = [], unfinished = 0; // responses that never end on their own: only the client tearing down the socket closes them
   const srv = http.createServer((req, res) => {
     seen.push([req.headers.host, req.url, req.headers.authorization ?? null]);
-    if (["/hang", "/stall", "/trickle"].includes(req.url)) { unfinished++; res.on("close", () => unfinished--); }
+    if (["/hang", "/stall", "/trickle", "/reason-stall", "/bad-header-stall"].includes(req.url)) { unfinished++; res.on("close", () => unfinished--); }
+    const reason = req.url.match(/^\/reason\/(\w+)$/); // raw socket writes: Node's own writer refuses these bytes
+    if (reason) return req.socket.end(Buffer.concat([rawHead([...Buffer.from("200 "), ...REASONS[reason[1]]], "Content-Length: 2", "Connection: close"), Buffer.from("ok")]));
+    // A megabyte of body and then silence, so undici's parser pauses on backpressure once nobody reads.
+    if (req.url === "/reason-stall") return req.socket.write(Buffer.concat([rawHead([...Buffer.from("200 "), ...REASONS.euro]), Buffer.alloc(MiB, 0x20)]));
+    if (req.url === "/bad-header-stall") return req.socket.write(Buffer.concat([rawHead("200 OK", "X A: b"), Buffer.alloc(MiB, 0x20)]));
     if (gzipped[req.url]) { res.writeHead(200, { "content-encoding": "gzip", "content-type": "application/json" }); return res.end(gzipped[req.url]); }
     if (req.url === "/hop") { res.writeHead(302, { location: "https://other.example/echo" }); return res.end("moved"); }
     if (req.url === "/echo") return res.end("ok");
@@ -248,8 +270,20 @@ section("netguard limits", async () => {
     assert.ok(await elapsed(assert.rejects(d("https://c.example/hang"), NetGuardError)) < 2000);
     const trickle = await d("https://c.example/trickle");
     assert.ok(await elapsed(assert.rejects(trickle.arrayBuffer(), { name: "NetGuardError", message: "No complete response within 0.3 s" })) < 2000);
-    for (let i = 0; i < 100 && unfinished > 0; i++) await new Promise((r) => setTimeout(r, 10));
-    assert.equal(unfinished, 0, "every timed-out or aborted response released its connection");
+    // A hostile reason phrase is dropped rather than failing the re-wrap after the body is in flight: the response
+    // comes back, and when nobody reads its endless body the deadline (still armed) tears the connection down.
+    for (const kind of ["euro", "ctl", "nul", "lone"]) {
+      const r = await g(`https://c.example/reason/${kind}`);
+      assert.deepEqual([r.status, r.statusText, await r.text()], [200, "", "ok"], `reason phrase ${kind}`);
+    }
+    const cafe = await g("https://c.example/reason/cafe");
+    assert.deepEqual([cafe.statusText, await cafe.text()], ["Café", "ok"], "a valid reason phrase is kept");
+    const unread = await d("https://c.example/reason-stall");
+    assert.deepEqual([unread.status, unread.statusText], [200, ""]);
+    // A header name undici passes but Headers refuses: NetGuardError, and the source is cancelled at once (g's deadline is 60 s).
+    await assert.rejects(g("https://c.example/bad-header-stall"), { name: "NetGuardError", message: "Malformed HTTP response" });
+    for (let i = 0; i < 300 && unfinished > 0; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(unfinished, 0, "every timed-out, aborted or refused response released its connection");
 
     // undici's manual redirects through the guard: Location followed, credentials left behind on the old origin.
     seen = [];
