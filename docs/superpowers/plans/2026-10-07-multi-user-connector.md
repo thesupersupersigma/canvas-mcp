@@ -46,7 +46,7 @@
   - `src/canvas.ts`: `CanvasConfig.fetch?: typeof fetch`, used by `raw()` and `download()` (default `globalThis.fetch`).
 
 - [ ] **Step 1:** Move code as above; `index.ts` keeps arg parsing, `check()`, `stdio()`, and dispatch. Canvas URL/token presence checks move inside the stdio/check/single-user paths (multi-user won't need them).
-- [ ] **Step 2:** Replace `America/Indianapolis` with `America/New_York` in README, `.env.example`, `test/mock-test.mjs`.
+- [ ] **Step 2:** Replace the location-specific example time zone with `America/New_York` in README, `.env.example`, `test/mock-test.mjs`.
 - [ ] **Step 3:** Make `mock-test.mjs` assert instead of only printing: `assert.equal(wrong.status, 404)`, `assert.equal(health, 200)`, every stdio tool call except `read_file 902` and `get_page nope` has `!isError`, and `list_courses` text contains `APUSH` and `AP Bio`.
 - [ ] **Step 4:** `package.json` `test` → `npm run build && node test/unit-test.mjs && node test/mock-test.mjs && node test/oauth-test.mjs` (the two new files get created in later tasks; until then run `npm run build && node test/mock-test.mjs`).
 - [ ] **Step 5:** Run `npm run build && node test/mock-test.mjs` → exits 0.
@@ -143,5 +143,5 @@
 **Files:** Modify `README.md`, `.env.example`, `--help` text in `src/index.ts`
 
 - [ ] **Step 1:** README "Option D: Host it for everyone (multi-user)": what students see; Coolify steps (Dockerfile resource, env `PUBLIC_URL`, `CANVAS_MCP_KEY` from `openssl rand -hex 32`, port 7341, `/health`); public HTTPS via Cloudflare Tunnel (domain DNS must be on Cloudflare) or another reverse proxy; security notes (operator trust, key rotation logs everyone out, students revoke by deleting their Canvas token); new env vars table. Add env vars (commented) to `.env.example` and `--help`.
-- [ ] **Step 2:** `grep -rniE "indianapolis|thesuper" --exclude-dir=node_modules --exclude-dir=.git .` → no matches.
+- [ ] **Step 2:** Run the personal-identifier sweep over the repo (excluding node_modules, .git, LICENSE) → no matches.
 - [ ] **Step 3:** `npm test` → passes. Commit `docs: multi-user hosting guide`, push `master`.
