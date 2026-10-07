@@ -8,7 +8,7 @@
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "check": "node dist/index.js --check",
-    "test": "node test/mock-test.mjs"
+    "test": "npm run build && node test/mock-test.mjs"
   },
   "license": "MIT",
   "dependencies": {

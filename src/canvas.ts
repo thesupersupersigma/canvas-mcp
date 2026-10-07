@@ -4,6 +4,7 @@ export interface CanvasConfig {
   baseUrl: string; // e.g. https://myschool.instructure.com
   token: string;
   maxPages?: number;
+  fetch?: typeof fetch; // defaults to globalThis.fetch
 }
 
 export class CanvasError extends Error {
@@ -31,7 +32,7 @@ export class CanvasClient {
   }
 
   private async raw(url: string): Promise<Response> {
-    const res = await fetch(url, {
+    const res = await (this.cfg.fetch ?? fetch)(url, {
       headers: { Authorization: `Bearer ${this.cfg.token}`, Accept: "application/json+canvas-string-ids, application/json" },
     });
     if (!res.ok) {
@@ -68,7 +69,7 @@ export class CanvasClient {
   /** Downloads a file (Canvas file URLs redirect to signed S3/CDN links). */
   async download(url: string): Promise<{ bytes: Uint8Array; contentType: string }> {
     // Signed download URLs don't need the bearer token, but Canvas-hosted ones do.
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${this.cfg.token}` }, redirect: "follow" });
+    const res = await (this.cfg.fetch ?? fetch)(url, { headers: { Authorization: `Bearer ${this.cfg.token}` }, redirect: "follow" });
     if (!res.ok) throw new CanvasError(res.status, `File download failed: ${res.status}`);
     return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") ?? "" };
   }

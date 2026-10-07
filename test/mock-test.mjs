@@ -1,10 +1,12 @@
 // Mock Canvas API + MCP client test harness.
 import http from "node:http";
+import assert from "node:assert/strict";
 import fs from "node:fs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { spawn } from "node:child_process";
+import { CanvasClient } from "../dist/canvas.js";
 
 const S = new URL("./fixtures", import.meta.url).pathname;
 const TOKEN = "test-token";
@@ -58,6 +60,13 @@ const mock = http.createServer((req, res) => {
 });
 await new Promise((r) => mock.listen(4555, r));
 
+// CanvasClient routes every request through an injected fetch.
+const seen = [];
+const spy = new CanvasClient({ baseUrl: base, token: TOKEN, fetch: (u, i) => (seen.push(String(u)), fetch(u, i)) });
+assert.equal((await spy.get("/users/self")).id, 1);
+await spy.download(base + "/download/900");
+assert.deepEqual(seen, [base + "/api/v1/users/self", base + "/download/900"]);
+
 const results = [];
 async function run(client, label) {
   const tools = await client.listTools();
@@ -74,24 +83,36 @@ async function run(client, label) {
   ] : [["list_courses", {}]];
   for (const [name, args] of calls) {
     const r = await client.callTool({ name, arguments: args });
-    results.push(`\n=== ${label}:${name} ${JSON.stringify(args)}${r.isError ? " [isError]" : ""}\n${r.content[0].text.slice(0, 700)}`);
+    const text = r.content[0].text;
+    results.push(`\n=== ${label}:${name} ${JSON.stringify(args)}${r.isError ? " [isError]" : ""}\n${text.slice(0, 700)}`);
+    const expectError = (name === "read_file" && args.file_id === "902") || (name === "get_page" && args.page_url === "nope");
+    assert.equal(!!r.isError, expectError, `${label}:${name} ${JSON.stringify(args)} isError`);
+    if (name === "list_courses") for (const c of ["APUSH", "AP Bio"]) assert.ok(text.includes(c), `${label}:list_courses lists ${c}`);
   }
 }
 
-const env = { ...process.env, CANVAS_BASE_URL: base, CANVAS_API_TOKEN: TOKEN, CANVAS_TZ: "America/Indianapolis" };
-const stdioClient = new Client({ name: "t", version: "1" });
-await stdioClient.connect(new StdioClientTransport({ command: "node", args: ["dist/index.js"], env }));
-await run(stdioClient, "stdio");
-await stdioClient.close();
+const env = { ...process.env, CANVAS_BASE_URL: base, CANVAS_API_TOKEN: TOKEN, CANVAS_TZ: "America/New_York" };
+let srv;
+try {
+  const stdioClient = new Client({ name: "t", version: "1" });
+  await stdioClient.connect(new StdioClientTransport({ command: "node", args: ["dist/index.js"], env }));
+  await run(stdioClient, "stdio");
+  await stdioClient.close();
 
-const secret = "a".repeat(32);
-const srv = spawn("node", ["dist/index.js", "--http", "--port", "4556", "--secret", secret], { env });
-await new Promise((r) => setTimeout(r, 800));
-const h = new Client({ name: "t", version: "1" });
-await h.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:4556/mcp/${secret}`)));
-await run(h, "http");
-const wrong = await fetch("http://127.0.0.1:4556/mcp/wrongsecret", { method: "POST" });
-results.push(`\n[http] wrong secret -> ${wrong.status}; health -> ${(await fetch("http://127.0.0.1:4556/health")).status}`);
-await h.close(); srv.kill();
-console.log(results.join("\n"));
-mock.close();
+  const secret = "a".repeat(32);
+  srv = spawn("node", ["dist/index.js", "--http", "--port", "4556", "--secret", secret], { env });
+  await new Promise((r) => setTimeout(r, 800));
+  const h = new Client({ name: "t", version: "1" });
+  await h.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:4556/mcp/${secret}`)));
+  await run(h, "http");
+  const wrong = await fetch("http://127.0.0.1:4556/mcp/wrongsecret", { method: "POST" });
+  const health = (await fetch("http://127.0.0.1:4556/health")).status;
+  results.push(`\n[http] wrong secret -> ${wrong.status}; health -> ${health}`);
+  assert.equal(wrong.status, 404);
+  assert.equal(health, 200);
+  await h.close();
+} finally {
+  console.log(results.join("\n"));
+  srv?.kill();
+  mock.close();
+}

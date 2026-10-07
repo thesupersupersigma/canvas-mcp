@@ -61,7 +61,7 @@ Pick whichever option fits how you use Claude.
 claude mcp add canvas --scope user \
   -e CANVAS_BASE_URL=https://yourschool.instructure.com \
   -e CANVAS_API_TOKEN=xxxx \
-  -e CANVAS_TZ=America/Indianapolis \
+  -e CANVAS_TZ=America/New_York \
   -- node /ABSOLUTE/PATH/TO/canvas-mcp/dist/index.js
 ```
 
@@ -78,7 +78,7 @@ Open the config file from Claude Desktop → Settings → Developer → Edit Con
       "env": {
         "CANVAS_BASE_URL": "https://yourschool.instructure.com",
         "CANVAS_API_TOKEN": "xxxx",
-        "CANVAS_TZ": "America/Indianapolis"
+        "CANVAS_TZ": "America/New_York"
       }
     }
   }
