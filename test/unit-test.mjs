@@ -2,9 +2,15 @@
 import assert from "node:assert/strict";
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
 import dns from "node:dns";
+import http from "node:http";
 import net from "node:net";
-import { createGuardedFetch, guardedLookup, isPublicAddress, NetGuardError, withUrlGuard } from "../dist/netguard.js";
+import tls from "node:tls";
+import zlib from "node:zlib";
+import * as netguard from "../dist/netguard.js";
 import { Sealer } from "../dist/seal.js";
+
+const { _testing, createGuardedFetch, isPublicAddress, NetGuardError } = netguard;
+const { guardedFetch, guardedLookup, LIMITS, withUrlGuard } = _testing;
 
 const sections = [];
 const section = (name, fn) => sections.push({ name, fn });
@@ -62,6 +68,8 @@ section("seal", () => {
 });
 
 section("netguard", async () => {
+  assert.deepEqual(Object.keys(netguard).sort(), ["NetGuardError", "_testing", "createGuardedFetch", "isPublicAddress"],
+    "public surface is the brief's three exports; the unsafe-alone helpers live only under _testing");
   const blocked = ["127.0.0.1", "10.1.2.3", "172.20.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "::1", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "0.0.0.0",
     "0.1.2.3", "100.127.255.255", "172.16.0.0", "172.31.255.255", "192.0.0.8", "198.18.0.1", "198.19.255.255", "224.0.0.1", "239.255.255.250", "240.0.0.1", "255.255.255.255",
     "::", "::ffff:7f00:1", "::ffff:a9fe:a9fe", "::ffff:0a00:0001", "0:0:0:0:0:ffff:c0a8:0101", "::127.0.0.1", "::7f00:1", "fc00::1", "fdff:ffff::1", "fe80::1%eth0", "febf::1",
@@ -158,6 +166,105 @@ section("netguard", async () => {
   await assert.rejects(one(307)("https://a.example/", { method: "POST", body: "x" }), NetGuardError, "only GET/HEAD redirects are followed");
   assert.equal((await withUrlGuard(fake({ "https://a.example/": () => new Response(null, { status: 304 }) }))("https://a.example/")).status, 304);
   await assert.rejects(withUrlGuard(fake({}))(new Request("https://a.example/")), TypeError, "Request objects refused");
+
+  // The body cap applies to the final response only; cancelled redirect bodies don't count.
+  const tiny = (routes) => withUrlGuard(fake(routes), { deadlineMs: 5000, maxBodyBytes: 4 });
+  const long = () => new Response("x".repeat(100), { status: 302, headers: { location: "/four" } });
+  assert.equal(await (await tiny({ "https://a.example/": long, "https://a.example/four": () => new Response("four") })("https://a.example/")).text(), "four");
+  await assert.rejects((await tiny({ "https://a.example/": () => new Response("fives") })("https://a.example/")).text(), NetGuardError);
+
+  // The deadline ends the body even when the transport ignores the abort signal and keeps feeding bytes.
+  let drip, giveUpTimer, cancelled = false;
+  const endless = () => new Response(new ReadableStream({
+    start(c) { drip = setInterval(() => c.enqueue(new Uint8Array(1)), 10); },
+    cancel() { cancelled = true; clearInterval(drip); },
+  }));
+  try {
+    const slow = await withUrlGuard(fake({ "https://a.example/": endless }), { deadlineMs: 100, maxBodyBytes: 1e6 })("https://a.example/");
+    const giveUp = new Promise((_, reject) => { giveUpTimer = setTimeout(() => reject(new Error("deadline never fired")), 2000); });
+    await assert.rejects(Promise.race([slow.arrayBuffer(), giveUp]), { name: "NetGuardError", message: "No complete response within 0.1 s" });
+    assert.ok(cancelled, "source body cancelled at the deadline");
+  } finally { clearInterval(drip); clearTimeout(giveUpTimer); }
+});
+
+section("netguard limits", async () => {
+  const MiB = 1024 * 1024;
+  assert.deepEqual({ ...LIMITS }, { connectTimeoutMs: 10_000, headersTimeoutMs: 20_000, bodyTimeoutMs: 20_000, deadlineMs: 60_000, maxBodyBytes: 60 * MiB });
+  assert.ok(Object.isFrozen(LIMITS));
+
+  // A hostile "Canvas" on a local plain-HTTP server. tls.connect is pointed at it (so no certificate is needed);
+  // everything else is the real stack: undici's Agent with our options, its gzip decoding, and the guard.
+  const gz = (n) => zlib.gzipSync(Buffer.alloc(n));
+  const gzipped = { "/1mib.gz": gz(MiB), "/2mib.gz": gz(2 * MiB), "/60mib-plus-1.gz": gz(60 * MiB + 1) };
+  let seen = [], unfinished = 0; // responses that never end on their own: only the client tearing down the socket closes them
+  const srv = http.createServer((req, res) => {
+    seen.push([req.headers.host, req.url, req.headers.authorization ?? null]);
+    if (["/hang", "/stall", "/trickle"].includes(req.url)) { unfinished++; res.on("close", () => unfinished--); }
+    if (gzipped[req.url]) { res.writeHead(200, { "content-encoding": "gzip", "content-type": "application/json" }); return res.end(gzipped[req.url]); }
+    if (req.url === "/hop") { res.writeHead(302, { location: "https://other.example/echo" }); return res.end("moved"); }
+    if (req.url === "/echo") return res.end("ok");
+    if (req.url === "/status-999") { res.writeHead(999); return res.end("x"); }
+    if (req.url === "/raw-over-1mib") { res.writeHead(200); return res.end(Buffer.alloc(MiB + 1)); }
+    if (req.url === "/stall") { res.writeHead(200); return res.write("x"); } // headers and one byte, then silence
+    if (req.url === "/trickle") { // a byte every 50 ms, forever: never trips a per-chunk body timeout
+      res.writeHead(200);
+      const t = setInterval(() => res.write("x"), 50);
+      return res.on("close", () => clearInterval(t));
+    } // "/hang": never answers
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const realConnect = tls.connect, connects = [];
+  tls.connect = (opts) => {
+    connects.push(opts);
+    const s = net.connect(srv.address().port, "127.0.0.1");
+    s.once("connect", () => s.emit("secureConnect"));
+    return s;
+  };
+  const elapsed = async (p) => { const t0 = Date.now(); await p; return Date.now() - t0; };
+  try {
+    // Decoded-size cap: a small gzip body can't inflate past the cap, whichever way the body is read.
+    const g = guardedFetch({ ...LIMITS, maxBodyBytes: MiB });
+    assert.equal((await (await g("https://c.example/1mib.gz")).arrayBuffer()).byteLength, MiB, "exactly at the cap is fine");
+    for (const read of ["arrayBuffer", "json", "text"]) await assert.rejects((await g("https://c.example/2mib.gz"))[read](), NetGuardError, read);
+    // Wire-size cap (the Agent's maxResponseSize) on an uncompressed body.
+    await assert.rejects(g("https://c.example/raw-over-1mib").then((r) => r.arrayBuffer()), (e) => !(e instanceof NetGuardError) && e.cause?.code === "UND_ERR_RES_EXCEEDED_MAX_SIZE");
+    // The production instance carries the 60 MiB default: about 60 kB of gzip on the wire, refused once decoded.
+    await assert.rejects((await createGuardedFetch()("https://c.example/60mib-plus-1.gz")).arrayBuffer(), { name: "NetGuardError", message: "Response body is over 60 MB" });
+
+    // Per-response timeouts on the Agent (undici's coarse timers make each take about a second, so run both at once).
+    const t = guardedFetch({ ...LIMITS, headersTimeoutMs: 200, bodyTimeoutMs: 200, deadlineMs: 5000 });
+    await Promise.all([
+      assert.rejects(t("https://c.example/hang"), (e) => e.cause?.code === "UND_ERR_HEADERS_TIMEOUT"),
+      assert.rejects(t("https://c.example/stall").then((r) => r.arrayBuffer()), (e) => e.cause?.code === "UND_ERR_BODY_TIMEOUT"),
+    ]);
+    // The caller's own signal still works, before and during the request.
+    await assert.rejects(t("https://c.example/hang", { signal: AbortSignal.abort(new Error("early")) }), { message: "early" });
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(new Error("caller")), 50);
+    await assert.rejects(t("https://c.example/hang", { signal: ac.signal }), { message: "caller" });
+
+    // Overall deadline: covers waiting for headers and a body that trickles in under the per-chunk timeout.
+    const d = guardedFetch({ ...LIMITS, headersTimeoutMs: 5000, bodyTimeoutMs: 5000, deadlineMs: 300 });
+    assert.ok(await elapsed(assert.rejects(d("https://c.example/hang"), NetGuardError)) < 2000);
+    const trickle = await d("https://c.example/trickle");
+    assert.ok(await elapsed(assert.rejects(trickle.arrayBuffer(), { name: "NetGuardError", message: "No complete response within 0.3 s" })) < 2000);
+    for (let i = 0; i < 100 && unfinished > 0; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(unfinished, 0, "every timed-out or aborted response released its connection");
+
+    // undici's manual redirects through the guard: Location followed, credentials left behind on the old origin.
+    seen = [];
+    const res = await g("https://c.example/hop", { headers: { Authorization: "Bearer t" } });
+    assert.equal(await res.text(), "ok");
+    assert.equal(res.url, "https://other.example/echo", "url survives the body re-wrap");
+    assert.deepEqual(seen, [["c.example", "/hop", "Bearer t"], ["other.example", "/echo", null]]);
+    // A status no Response can carry is refused cleanly rather than escaping as a RangeError.
+    await assert.rejects(g("https://c.example/status-999"), { name: "NetGuardError", message: "Unexpected HTTP status 999" });
+    assert.ok(connects.length > 0 && connects.every((o) => o.lookup === guardedLookup), "every connection resolves through guardedLookup");
+  } finally {
+    tls.connect = realConnect;
+    srv.closeAllConnections();
+    srv.close();
+  }
 });
 
 let failed = 0;
