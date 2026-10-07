@@ -318,6 +318,10 @@ section("login", async () => {
   for (const [input, want] of [["http://127.0.0.1:4557/api", "http://127.0.0.1:4557"], ["http://localhost:4557", "http://localhost:4557"], ["https://x.com:8443/", "https://x.com:8443"]])
     assert.equal(normalizeCanvasUrl(input, true), want, `${input} with allowHttp`);
   for (const bad of ["ftp://x.com", "javascript:alert(1)", "https://u:p@x.com"]) assert.equal(normalizeCanvasUrl(bad, true), null, `${bad} with allowHttp`);
+  // A real Canvas never runs on a bare IP, however it is spelled (the URL parser reads "123" and "0x7f.1" as IPv4).
+  for (const bad of ["https://123", "https://0x7f.1", "https://10.0.0.1", "https://[::1]", "8.8.8.8", "https://1.1.1.1/", "https://[2001:db8::1]/", "https://017.0.0.1"])
+    assert.equal(normalizeCanvasUrl(bad), null, bad);
+  assert.equal(normalizeCanvasUrl("http://127.0.0.1:4555", true), "http://127.0.0.1:4555", "IPs are fine in test mode");
   const longest = "https://x.com/" + "a".repeat(2048 - 14);
   assert.equal(normalizeCanvasUrl(longest), "https://x.com", "2048 chars is fine");
   assert.equal(normalizeCanvasUrl(longest + "a"), null, "over 2048 chars refused");
@@ -362,34 +366,42 @@ section("login", async () => {
     for (const headers of [{ "sec-fetch-site": "same-origin" }, { origin: bad }])
       assert.throws(() => isSameOriginPost(headers, bad), Error, JSON.stringify(bad));
 
-  // verifyCanvasLogin: null on success, otherwise exactly one of three messages, never upstream text or error details.
+  // verifyCanvasLogin: { url } (the Canvas origin actually verified) on success, otherwise { error } with exactly one of
+  // three messages, never upstream text or error details.
   const MSG = {
-    rejected: "Canvas rejected that token. Check that you copied the whole token, or make a new one.",
-    unreachable: "Couldn't reach a Canvas server at that address.",
-    notCanvas: "That doesn't look like a Canvas server.",
+    rejected: { error: "Canvas rejected that token. Check that you copied the whole token, or make a new one." },
+    unreachable: { error: "Couldn't reach a Canvas server at that address." },
+    notCanvas: { error: "That doesn't look like a Canvas server." },
   };
   const cred = { url: "https://yourschool.instructure.com", token: "1234~abcDEF", tz: "America/New_York" };
-  let req, released;
-  const body = (text) => new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(text)); c.close(); }, cancel() { released = true; } });
-  const verify = (make, c = cred) => verifyCanvasLogin(c, async (url, init) => { req = { url, init }; released = false; return make(); });
+  let reqs, released;
+  const body = (text) => new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(text)); c.close(); }, cancel() { released++; } });
+  const verify = (make, c = cred) => {
+    reqs = [];
+    released = 0;
+    return verifyCanvasLogin(c, async (url, init) => { reqs.push({ url, init }); return make(url, reqs.length); });
+  };
+  const auth = (r) => new Headers(r.init.headers).get("authorization");
 
-  assert.equal(await verify(() => new Response(body('{"id":7,"name":"A Student"}'), { headers: { "content-type": "application/json" } })), null);
+  assert.deepEqual(await verify(() => new Response(body('{"id":7,"name":"A Student"}'), { headers: { "content-type": "application/json" } })), { url: cred.url });
+  assert.equal(reqs.length, 1);
+  const [req] = reqs;
   assert.equal(req.url, "https://yourschool.instructure.com/api/v1/users/self");
-  const sent = new Headers(req.init.headers);
-  assert.equal(sent.get("authorization"), "Bearer 1234~abcDEF");
-  assert.equal(sent.get("accept"), "application/json");
+  assert.equal(auth(req), "Bearer 1234~abcDEF");
+  assert.equal(new Headers(req.init.headers).get("accept"), "application/json");
+  assert.equal(req.init.redirect, "manual", "redirects are handled here, not by the fetch");
   assert.ok(req.init.signal instanceof AbortSignal && !req.init.signal.aborted, "the request carries a timeout signal");
-  assert.equal(await verify(() => Response.json({ id: "7" })), null, "string ids count");
-  assert.equal(await verify(() => Response.json({ id: 1, pad: "x".repeat(256 * 1024) })), null, "a large profile is fine");
+  assert.deepEqual(await verify(() => Response.json({ id: "7" })), { url: cred.url }, "string ids count");
+  assert.deepEqual(await verify(() => Response.json({ id: 1, pad: "x".repeat(256 * 1024) })), { url: cred.url }, "a large profile is fine");
 
-  assert.equal(await verify(() => new Response(body('{"errors":[{"message":"Invalid access token."}]}'), { status: 401 })), MSG.rejected);
-  assert.ok(released, "401 body released unread");
+  assert.deepEqual(await verify(() => new Response(body('{"errors":[{"message":"Invalid access token."}]}'), { status: 401 })), MSG.rejected);
+  assert.equal(released, 1, "401 body released unread");
   for (const status of [302, 400, 403, 404, 429, 500, 503]) {
-    assert.equal(await verify(() => new Response(body("upstream detail"), { status })), MSG.notCanvas, `HTTP ${status}`);
-    assert.ok(released, `HTTP ${status} body released unread`);
+    assert.deepEqual(await verify(() => new Response(body("upstream detail"), { status })), MSG.notCanvas, `HTTP ${status}`);
+    assert.equal(released, 1, `HTTP ${status} body released unread`);
   }
   for (const text of ["<!doctype html><title>Log in</title>", "", "null", "[]", '"x"', "7", "{}", '{"id":null}', '{"id":""}', '{"name":"x"}', "{bad json"])
-    assert.equal(await verify(() => new Response(body(text))), MSG.notCanvas, JSON.stringify(text));
+    assert.deepEqual(await verify(() => new Response(body(text))), MSG.notCanvas, JSON.stringify(text));
   // Valid JSON with an id, but far bigger than any profile: reading stops at a small cap and the rest is released.
   let pulled = 0;
   const huge = () => new Response(new ReadableStream({
@@ -399,28 +411,74 @@ section("login", async () => {
       c.enqueue(new TextEncoder().encode('"}'));
       c.close();
     },
-    cancel() { released = true; },
+    cancel() { released++; },
   }));
-  assert.equal(await verify(huge), MSG.notCanvas, "oversized body");
+  assert.deepEqual(await verify(huge), MSG.notCanvas, "oversized body");
   assert.ok(released && pulled <= 2 * 1048576, `stopped reading early (${pulled} bytes) and released the rest`);
+
+  // Many schools' xxx.instructure.com redirects to a vanity domain (or the reverse). The guarded fetch drops the token on
+  // a cross-origin hop, so the redirect is handled here: the token is tried once more at the new origin, and that origin
+  // is the one returned (and stored).
+  const moved = (location, status = 301) => new Response(body("Moved"), { status, headers: { location } });
+  const vanity = { ...cred, url: "https://a.instructure.com" };
+  assert.deepEqual(await verify((url, n) => n === 1 ? moved("https://canvas.school-example.edu/api/v1/users/self") : Response.json({ id: 1 }), vanity),
+    { url: "https://canvas.school-example.edu" });
+  assert.deepEqual(reqs.map((r) => r.url), ["https://a.instructure.com/api/v1/users/self", "https://canvas.school-example.edu/api/v1/users/self"]);
+  assert.deepEqual(reqs.map(auth), ["Bearer 1234~abcDEF", "Bearer 1234~abcDEF"], "the second request carries the token too");
+  assert.deepEqual(reqs.map((r) => r.init.redirect), ["manual", "manual"]);
+  assert.equal(reqs[1].init.signal, reqs[0].init.signal, "one timeout covers the whole login attempt");
+  assert.equal(released, 1, "the redirect's body released unread");
+  for (const [status, location] of [[302, "https://canvas.school-example.edu/login"], [303, "//canvas.school-example.edu/x"], [307, "HTTPS://Canvas.School-Example.EDU:443/"],
+    [308, "https://canvas.school-example.edu"]])
+    assert.deepEqual(await verify((url, n) => n === 1 ? moved(location, status) : Response.json({ id: 1 }), vanity), { url: "https://canvas.school-example.edu" }, `${status} ${location}`);
+  assert.deepEqual(await verify((url, n) => n === 1 ? moved("https://canvas.school-example.edu/") : new Response(body("{}"), { status: 401 }), vanity), MSG.rejected,
+    "a token the canonical origin refuses");
+  assert.equal(released, 2);
+  // Only one hop, and only to another origin that is itself a plausible Canvas address.
+  assert.deepEqual(await verify((url, n) => moved(`https://b${n}.instructure.com/api/v1/users/self`), vanity), MSG.notCanvas, "two cross-origin redirects");
+  assert.deepEqual([reqs.length, released], [2, 2]);
+  for (const location of ["javascript:alert(1)", "https://10.0.0.1/x", "/login", "https://a.instructure.com/login", "http://canvas.school-example.edu/",
+    "https://canvas.school-example.edu:8443/", "https://intranet/", "https://[::1]/", "https://[", "data:text/html,hi", "ftp://canvas.school-example.edu/"]) {
+    assert.deepEqual(await verify(() => moved(location), vanity), MSG.notCanvas, location);
+    assert.deepEqual([reqs.length, released], [1, 1], `${location}: no second fetch`);
+  }
+  // Test mode (an http:// Canvas) follows http redirects, but still only to an http(s) origin.
+  const mock = { ...cred, url: "http://127.0.0.1:4557" };
+  assert.deepEqual(await verify((url, n) => n === 1 ? moved("http://localhost:4558/x") : Response.json({ id: 1 }), mock), { url: "http://localhost:4558" });
+  for (const location of ["javascript:alert(1)", "data:text/html,hi", "ftp://127.0.0.1/"]) {
+    assert.deepEqual(await verify(() => moved(location), mock), MSG.notCanvas, `${location} from an http Canvas`);
+    assert.equal(reqs.length, 1, `${location} from an http Canvas: no second fetch`);
+  }
 
   const failure = (message, code) => Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(message), { code }) });
   for (const err of [new NetGuardError("nas.lan resolves to a non-public address"), new NetGuardError("10.0.0.1 is not a public address"),
     new NetGuardError("Only https URLs are allowed, not http:"), failure("getaddrinfo ENOTFOUND intranet.example", "ENOTFOUND"),
     failure("connect ECONNREFUSED 203.0.113.7:443", "ECONNREFUSED"), failure("certificate has expired", "CERT_HAS_EXPIRED"),
-    new DOMException("The operation was aborted due to timeout", "TimeoutError"), new DOMException("This operation was aborted", "AbortError"), new Error("other")])
-    assert.equal(await verify(() => { throw err; }), MSG.unreachable, err.message);
+    new DOMException("The operation was aborted due to timeout", "TimeoutError"), new DOMException("This operation was aborted", "AbortError"), new Error("other")]) {
+    assert.deepEqual(await verify(() => { throw err; }), MSG.unreachable, err.message);
+    assert.deepEqual(await verify((url, n) => { if (n === 1) return moved("https://canvas.school-example.edu/"); throw err; }, vanity), MSG.unreachable, `after a redirect: ${err.message}`);
+  }
   const cut = () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"id":')); }, pull(c) { c.error(new TypeError("terminated")); } }));
-  assert.equal(await verify(cut), MSG.unreachable, "connection lost mid-body");
+  assert.deepEqual(await verify(cut), MSG.unreachable, "connection lost mid-body");
 
-  for (const token of ["", "abc def", "abc\r\nX-Injected: 1", "tøken", "a​b", undefined, ["1234~abcDEF"]]) {
-    req = undefined;
-    assert.equal(await verify(() => Response.json({ id: 1 }), { ...cred, token }), MSG.rejected, JSON.stringify(token));
-    assert.equal(req, undefined, `${JSON.stringify(token)} can't be a Canvas token, so it is never sent`);
+  // The caller must pass a normalized origin; anything else is refused without a request.
+  for (const url of ["https://evil.example/x?", "https://yourschool.instructure.com/", "https://YourSchool.instructure.com", "yourschool.instructure.com",
+    "https://yourschool.instructure.com:443", "https://u@yourschool.instructure.com", "null", "", undefined, null, ["https://yourschool.instructure.com"]]) {
+    assert.deepEqual(await verify(() => Response.json({ id: 1 }), { ...cred, url }), MSG.unreachable, JSON.stringify(url));
+    assert.equal(reqs.length, 0, `${JSON.stringify(url)} is never fetched`);
   }
 
+  for (const token of ["", "abc def", "abc\r\nX-Injected: 1", "tøken", "a​b", "a".repeat(513), undefined, ["1234~abcDEF"]]) {
+    const what = String(JSON.stringify(token)).slice(0, 40);
+    assert.deepEqual(await verify(() => Response.json({ id: 1 }), { ...cred, token }), MSG.rejected, what);
+    assert.equal(reqs.length, 0, `${what} can't be a Canvas token, so it is never sent`);
+  }
+  const maxToken = "~" + Array.from({ length: 511 }, (_, i) => String.fromCharCode(0x21 + (i % 94))).join("");
+  assert.deepEqual(await verify(() => Response.json({ id: 1 }), { ...cred, token: maxToken }), { url: cred.url }, "512 visible ASCII characters");
+  assert.equal(auth(reqs[0]), `Bearer ${maxToken}`);
+
   // Real fetch against a local stand-in for Canvas, and the real guard in front of it.
-  let hits = 0, seen;
+  let hits = 0, conns = 0, seen;
   const srv = http.createServer((rq, rs) => {
     hits++;
     seen = { url: rq.url, auth: rq.headers.authorization, accept: rq.headers.accept };
@@ -429,42 +487,49 @@ section("login", async () => {
     rs.writeHead(200, { "content-type": "application/json" });
     rs.end('{"id":1,"name":"A Student"}');
   });
+  srv.on("connection", () => conns++);
   await new Promise((r) => srv.listen(0, "127.0.0.1", r));
   const port = srv.address().port, local = `http://127.0.0.1:${port}`;
+  // A second stand-in that only redirects, like an instructure.com address in front of a school's own domain.
+  const mover = http.createServer((rq, rs) => { rs.writeHead(301, { location: `${local}/api/v1/users/self` }); rs.end("Moved"); });
+  await new Promise((r) => mover.listen(0, "127.0.0.1", r));
   const plain = createGuardedFetch({ allowPrivate: true }), guarded = createGuardedFetch();
   const login = (url, token, f) => verifyCanvasLogin({ url, token, tz: "UTC" }, f);
   const realTimeout = AbortSignal.timeout, realLookup = dns.lookup;
   try {
-    assert.equal(await login(local, "good~token", plain), null);
+    assert.deepEqual(await login(local, "good~token", plain), { url: local });
     assert.deepEqual(seen, { url: "/api/v1/users/self", auth: "Bearer good~token", accept: "application/json" });
-    assert.equal(await login(local, "wrong", plain), MSG.rejected);
+    assert.deepEqual(await login(local, "wrong", plain), MSG.rejected);
+    seen = undefined;
+    assert.deepEqual(await login(`http://127.0.0.1:${mover.address().port}`, "good~token", plain), { url: local }, "Node's fetch hands back the redirect");
+    assert.deepEqual(seen, { url: "/api/v1/users/self", auth: "Bearer good~token", accept: "application/json" });
 
     // 15 s per login attempt (shortened here, through AbortSignal.timeout, so the test doesn't wait).
     const asked = [];
     AbortSignal.timeout = (ms) => { asked.push(ms); return realTimeout.call(AbortSignal, 50); };
     const t0 = Date.now();
-    assert.equal(await login(local, "hang", plain), MSG.unreachable, "timeout");
+    assert.deepEqual(await login(local, "hang", plain), MSG.unreachable, "timeout");
     assert.ok(Date.now() - t0 < 2000, "gave up at the deadline");
     assert.deepEqual(asked, [15_000]);
     AbortSignal.timeout = realTimeout;
 
     // Everything the guard refuses reads the same as an address with nothing there, so the login page can't be
-    // used to find out which internal names exist.
-    const before = hits;
+    // used to find out which internal names exist. Connections are counted, not requests: a TLS hello sent to this
+    // plain-HTTP stand-in never becomes a request.
+    const before = [conns, hits];
     for (const url of [`https://127.0.0.1:${port}`, `https://localhost:${port}`, local])
-      assert.equal(await login(url, "good~token", guarded), MSG.unreachable, url);
-    assert.equal(hits, before, "the guard stopped all of them before they reached the server");
+      assert.deepEqual(await login(url, "good~token", guarded), MSG.unreachable, url);
+    assert.deepEqual([conns, hits], before, "the guard stopped all of them before they connected");
     dns.lookup = (host, opts, cb) => host === "nas.example"
       ? cb(null, [{ address: "192.168.1.10", family: 4 }])
       : cb(Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: "ENOTFOUND" }));
-    for (const url of ["https://nas.example", "https://missing.example"]) assert.equal(await login(url, "good~token", guarded), MSG.unreachable, url);
+    for (const url of ["https://nas.example", "https://missing.example"]) assert.deepEqual(await login(url, "good~token", guarded), MSG.unreachable, url);
   } finally {
     AbortSignal.timeout = realTimeout;
     dns.lookup = realLookup;
-    srv.closeAllConnections();
-    srv.close();
+    for (const s of [srv, mover]) { s.closeAllConnections(); s.close(); }
   }
-  assert.equal(await login(local, "good~token", plain), MSG.unreachable, "connection refused once the server is gone");
+  assert.deepEqual(await login(local, "good~token", plain), MSG.unreachable, "connection refused once the server is gone");
 });
 
 section("pages", () => {
@@ -486,7 +551,9 @@ section("pages", () => {
   assert.deepEqual([attr(f.tz, "type"), attr(f.tz, "id")], ["hidden", "tz"]);
   assert.equal(attr(f.canvas_url, "placeholder"), "https://yourschool.instructure.com");
   assert.equal(attr(f.canvas_url, "value"), "", "empty until a URL was entered");
-  assert.deepEqual([attr(f.token, "type"), attr(f.token, "autocomplete"), attr(f.token, "spellcheck")], ["password", "off", "false"]);
+  // Browsers ignore autocomplete=off on password fields; one-time-code keeps password managers from offering to save it.
+  assert.deepEqual([attr(f.token, "type"), attr(f.token, "autocomplete"), attr(f.token, "spellcheck")], ["password", "one-time-code", "false"]);
+  assert.ok(login.includes("Don't let your browser save this — it's a key to your Canvas account."), "don't-save line");
   assert.equal(attr(fields(loginPage({ authreq, redirectHost: "claude.ai", canvasUrl: "yourschool.instructure.com" })).canvas_url, "value"), "yourschool.instructure.com",
     "the entered URL is kept after an error");
   assert.doesNotMatch(login, /role="alert"/, "no error box without an error");

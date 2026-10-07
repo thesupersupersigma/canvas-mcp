@@ -104,7 +104,8 @@ ${error}<form method="post" action="/login">
 <label for="canvas_url">Your school's Canvas address</label>
 <input id="canvas_url" name="canvas_url" type="text" inputmode="url" autocomplete="url" autocapitalize="none" spellcheck="false" required placeholder="https://yourschool.instructure.com" value="${escapeHtml(p.canvasUrl ?? "")}">
 <label for="token">Canvas access token</label>
-<input id="token" name="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+<input id="token" name="token" type="password" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" required>
+<p class="muted">Don't let your browser save this — it's a key to your Canvas account.</p>
 <button type="submit">Log in</button>
 <p class="muted">After you log in you'll go back to <strong>${escapeHtml(p.redirectHost)}</strong>.</p>
 </form>

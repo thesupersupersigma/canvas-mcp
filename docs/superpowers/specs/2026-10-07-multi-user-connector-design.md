@@ -113,7 +113,11 @@ Express app, started by `--http` when `PUBLIC_URL` is set:
   (claude.ai traffic all comes from Anthropic's IPs, so per-IP would be wrong).
 - `trust proxy` from `TRUST_PROXY` (default `loopback, linklocal, uniquelocal`).
 - Security headers on HTML pages: CSP (`default-src 'none'`, inline style, script by hash,
-  `form-action 'self'`, `frame-ancestors 'none'`), `Referrer-Policy: no-referrer`.
+  `form-action 'self'` plus, on the login page, the origin of the client's redirect URI,
+  `frame-ancestors 'none'`), `Referrer-Policy: same-origin` (not `no-referrer`: under it the login
+  form's own POST carries `Origin: null`, which any page can send). `POST /login` is refused
+  (403) unless it comes from the login page itself: `Sec-Fetch-Site: same-origin`, or, from a
+  browser that sends no `Sec-Fetch-Site`, `Origin` equal to the server's own origin.
 - All reflected values HTML-escaped. Body size limits (login 10 kB, MCP 1 MB).
 - Logging: errors only, never tokens, request bodies, or Authorization headers.
 
