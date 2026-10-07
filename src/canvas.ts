@@ -1,7 +1,7 @@
 // Minimal Canvas LMS REST client: auth, pagination, error handling.
 
 export interface CanvasConfig {
-  baseUrl: string; // e.g. https://myschool.instructure.com
+  baseUrl: string; // e.g. https://yourschool.instructure.com
   token: string;
   maxPages?: number;
   fetch?: typeof fetch; // defaults to globalThis.fetch

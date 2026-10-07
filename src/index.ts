@@ -15,9 +15,9 @@ Usage:
   canvas-mcp --check                Test your token and list your courses, then exit
 
 Options (each also settable by env var):
-  --url <url>          Canvas base URL, e.g. https://school.instructure.com   [CANVAS_BASE_URL]
+  --url <url>          Canvas URL, e.g. https://yourschool.instructure.com    [CANVAS_BASE_URL]
   --token <token>      Canvas access token (prefer the env var)               [CANVAS_API_TOKEN]
-  --tz <zone>          Time zone for due dates (default: system)               [CANVAS_TZ]
+  --tz <zone>          Time zone for due dates (default: system)              [CANVAS_TZ]
   --max-chars <n>      Max characters per tool response chunk (default 20000) [CANVAS_MAX_CHARS]
   --http               Serve MCP over Streamable HTTP instead of stdio
   --port <n>           HTTP port (default 7341)                               [CANVAS_MCP_PORT]
@@ -28,11 +28,16 @@ Options (each also settable by env var):
   -h, --help
 
 Multi-user mode (--http with PUBLIC_URL instead of a secret; each student logs in with their own Canvas):
-  PUBLIC_URL                   The server's public origin, e.g. https://canvas.example.com
-  CANVAS_MCP_KEY               At least 32 chars; encrypts every token (try: openssl rand -hex 32)
+  Canvas URL, token and time zone come from each student's login; --port, --host and --max-chars still apply.
+  PUBLIC_URL                   The server's public origin, e.g. https://canvas.example.com (http only for localhost)
+  CANVAS_MCP_KEY               Random, at least 32 chars: openssl rand -hex 32. Encrypts every login;
+                               changing it logs everyone out
   CANVAS_MCP_REDIRECT_HOSTS    Optional: comma-separated origins that may receive logins
                                (default: https://claude.ai, https://claude.com, http://localhost, http://127.0.0.1)
-  TRUST_PROXY                  Optional: Express "trust proxy" (default: loopback, linklocal, uniquelocal)
+  TRUST_PROXY                  Optional: addresses/subnets of reverse proxies to believe about client IPs
+                               (default: loopback, linklocal, uniquelocal; "true" and hop counts don't work)
+  CANVAS_MCP_ALLOW_PRIVATE_NETWORK=1
+                               Testing only, never in production: turns the outbound network guard off
 `;
 
 const { values: a } = parseArgs({
