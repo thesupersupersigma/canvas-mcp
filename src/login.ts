@@ -21,6 +21,21 @@ export function normalizeCanvasUrl(input: string, allowHttp = false): string | n
   return /^[a-z\d-]+(\.[a-z\d-]+)+$/.test(url.hostname) ? url.origin : null;
 }
 
+/** Whether a POST /login came from this server's own login page. A cross-site form must be refused (403, and its
+ *  canvas_url never shown back): otherwise it could land a student on the real login page with an attacker's Canvas
+ *  address filled in, and the token they paste would be sent there. When the browser sends Sec-Fetch-Site, it decides;
+ *  when it doesn't, Origin must be exactly publicOrigin. That fallback works because pageHeaders sets
+ *  Referrer-Policy: same-origin (under no-referrer the page's own POST says "Origin: null", like any attacker's page).
+ *  `headers` is Node's req.headers (lowercase names; a header sent twice is joined, so it never matches). */
+export function isSameOriginPost(headers: Record<string, string | string[] | undefined>, publicOrigin: string): boolean {
+  let canonical = false;
+  try { canonical = /^https?:\/\//.test(publicOrigin) && new URL(publicOrigin).origin === publicOrigin; } catch {}
+  if (!canonical) throw new Error("publicOrigin must be the server's exact origin, scheme://host[:port]");
+  const site = headers["sec-fetch-site"];
+  if (site !== undefined) return site === "same-origin";
+  return headers["origin"] === publicOrigin;
+}
+
 /** The canonical name of a valid IANA time zone, else "UTC". */
 export function normalizeTimeZone(tz: unknown): string {
   if (typeof tz !== "string" || !/^[A-Za-z][\w+\-/]{0,63}$/.test(tz)) return "UTC";

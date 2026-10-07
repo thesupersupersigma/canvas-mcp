@@ -6,7 +6,7 @@ import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
 import zlib from "node:zlib";
-import { normalizeCanvasUrl, normalizeTimeZone, verifyCanvasLogin } from "../dist/login.js";
+import { isSameOriginPost, normalizeCanvasUrl, normalizeTimeZone, verifyCanvasLogin } from "../dist/login.js";
 import * as netguard from "../dist/netguard.js";
 import { errorPage, escapeHtml, landingPage, loginPage, pageHeaders } from "../dist/pages.js";
 import { Sealer } from "../dist/seal.js";
@@ -328,6 +328,40 @@ section("login", async () => {
   for (const bad of [undefined, "Not/AZone", "", "UTC\n", "+05:00", "America/New_York; x", "x".repeat(200), 42, null, ["America/New_York"], {}])
     assert.equal(normalizeTimeZone(bad), "UTC", JSON.stringify(bad));
 
+  // isSameOriginPost: POST /login must come from this server's own login page. Otherwise a cross-site form could land a
+  // student on the real login page with an attacker's Canvas address filled in, and the token they paste would go there.
+  const self = "https://canvas.example.com";
+  for (const [headers, want, why] of [
+    [{ "sec-fetch-site": "same-origin" }, true, "the login page's own form"],
+    [{ "sec-fetch-site": "same-origin", origin: self, referer: `${self}/authorize?x=1` }, true, "with its Origin and Referer"],
+    [{ "sec-fetch-site": "cross-site", origin: "null" }, false, "attacker page with Referrer-Policy: no-referrer"],
+    [{ "sec-fetch-site": "cross-site", origin: "https://evil.example" }, false, "attacker page"],
+    [{ "sec-fetch-site": "cross-site", origin: self }, false, "Sec-Fetch-Site decides when it is sent"],
+    [{ "sec-fetch-site": "same-site", origin: "https://other.canvas.example.com" }, false, "sibling subdomain"],
+    [{ "sec-fetch-site": "none" }, false, "not sent from a page"],
+    [{ "sec-fetch-site": "Same-Origin" }, false, "browsers send it lowercase"],
+    [{ "sec-fetch-site": "same-origin, cross-site" }, false, "header sent twice (Node joins the values)"],
+    [{ "sec-fetch-site": ["same-origin"] }, false, "array value"],
+    [{ "sec-fetch-site": "", origin: self }, false, "empty Sec-Fetch-Site is not absent"],
+    [{ origin: self }, true, "browser without Sec-Fetch-Site: Origin is checked instead"],
+    [{ origin: "null" }, false, "opaque origin, which any page can produce"],
+    [{ origin: "https://evil.example" }, false, "other origin"],
+    [{ origin: "https://canvas.example.com.evil.example" }, false, "lookalike origin"],
+    [{ origin: "http://canvas.example.com" }, false, "other scheme"],
+    [{ origin: "https://canvas.example.com:8443" }, false, "other port"],
+    [{ origin: "HTTPS://CANVAS.EXAMPLE.COM" }, false, "not the exact serialization"],
+    [{ origin: `${self}, https://evil.example` }, false, "header sent twice"],
+    [{ origin: [self] }, false, "array value"],
+    [{ referer: `${self}/authorize` }, false, "Referer alone is not enough"],
+    [{}, false, "no header at all"],
+  ]) assert.equal(isSameOriginPost(headers, self), want, `${why}: ${JSON.stringify(headers)}`);
+  assert.equal(isSameOriginPost({ origin: "http://127.0.0.1:4557" }, "http://127.0.0.1:4557"), true, "test server origin");
+  // The server's own origin must be exact; a wrong one is a programming error, so it throws whatever the request says.
+  for (const bad of ["", "null", "https://canvas.example.com/", "https://canvas.example.com/login", "canvas.example.com", "HTTPS://canvas.example.com",
+    "https://canvas.example.com:443", "file:///x", "ftp://canvas.example.com", undefined, null])
+    for (const headers of [{ "sec-fetch-site": "same-origin" }, { origin: bad }])
+      assert.throws(() => isSameOriginPost(headers, bad), Error, JSON.stringify(bad));
+
   // verifyCanvasLogin: null on success, otherwise exactly one of three messages, never upstream text or error details.
   const MSG = {
     rejected: "Canvas rejected that token. Check that you copied the whole token, or make a new one.",
@@ -463,7 +497,10 @@ section("pages", () => {
   assert.match(tzScript, /getElementById\("tz"\)\.value\s*=\s*Intl\.DateTimeFormat\(\)\.resolvedOptions\(\)\.timeZone/);
   const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-${createHash("sha256").update(tzScript).digest("base64")}'; ` +
     "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
-  const common = { "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Cache-Control": "no-store" };
+  // Referrer-Policy is same-origin, not no-referrer: under no-referrer browsers send "Origin: null" on the page's own form
+  // POST, which any attacker page can also produce, so the Origin fallback in isSameOriginPost could not work.
+  // same-origin still sends nothing to claude.ai or any other origin.
+  const common = { "Referrer-Policy": "same-origin", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Cache-Control": "no-store" };
   assert.deepEqual(pageHeaders(), { "Content-Security-Policy": csp, ...common });
   // The login form's POST ends in a redirect back to the client, and browsers hold that redirect to form-action too.
   for (const origin of ["https://claude.ai", "http://127.0.0.1:33418", "http://localhost:6274", "https://x.example:8443"])

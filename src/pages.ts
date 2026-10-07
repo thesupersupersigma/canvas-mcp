@@ -16,7 +16,10 @@ const TZ_HASH = createHash("sha256").update(TZ_SCRIPT, "utf8").digest("base64");
 const ORIGIN = /^https?:\/\/([a-z\d-]+(\.[a-z\d-]+)*|\[[\da-f:.]+\])(:\d{1,5})?$/;
 
 /** Security headers for every page. formActionOrigin (an exact origin such as https://claude.ai) is added to
- *  form-action for the login page, whose POST ends in a redirect there; browsers hold that redirect to form-action. */
+ *  form-action for the login page, whose POST ends in a redirect there; browsers hold that redirect to form-action.
+ *  Referrer-Policy is same-origin, not no-referrer: under no-referrer the login form's own POST carries "Origin: null",
+ *  which any attacker's page can also send, and isSameOriginPost (login.ts) relies on Origin when a browser sends no
+ *  Sec-Fetch-Site. same-origin still sends no referrer to claude.ai or any other origin. */
 export function pageHeaders(formActionOrigin?: string): Record<string, string> {
   let formAction = "'self'";
   if (formActionOrigin !== undefined) {
@@ -28,7 +31,7 @@ export function pageHeaders(formActionOrigin?: string): Record<string, string> {
   return {
     "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-${TZ_HASH}'; img-src 'self' data:; ` +
       `form-action ${formAction}; frame-ancestors 'none'; base-uri 'none'`,
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "same-origin",
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Cache-Control": "no-store",
