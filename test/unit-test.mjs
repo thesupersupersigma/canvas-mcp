@@ -2,15 +2,21 @@
 import assert from "node:assert/strict";
 import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
 import dns from "node:dns";
+import { EventEmitter } from "node:events";
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
 import zlib from "node:zlib";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { CanvasClient } from "../dist/canvas.js";
 import { isSameOriginPost, normalizeCanvasUrl, normalizeTimeZone, verifyCanvasLogin } from "../dist/login.js";
 import * as netguard from "../dist/netguard.js";
 import { DEFAULT_REDIRECT_ORIGINS, parseRedirectOrigins, redirectAllowed, StatelessProvider } from "../dist/oauth.js";
 import { errorPage, escapeHtml, landingPage, loginPage, pageHeaders } from "../dist/pages.js";
+import { WorkGate } from "../dist/public.js";
 import { Sealer } from "../dist/seal.js";
+import { buildServer } from "../dist/server.js";
 
 const { _testing, createGuardedFetch, isPublicAddress, NetGuardError } = netguard;
 const { guardedFetch, guardedLookup, LIMITS, withUrlGuard } = _testing;
@@ -267,6 +273,12 @@ section("netguard limits", async () => {
     const ac = new AbortController();
     setTimeout(() => ac.abort(new Error("caller")), 50);
     await assert.rejects(t("https://c.example/hang", { signal: ac.signal }), { message: "caller" });
+    // ...and while the body is still coming in (multi-user mode aborts a request's Canvas fetches when its client
+    // hangs up, say mid-download): the read fails at once, with the caller's reason, and the connection is released below.
+    const hangUp = new AbortController();
+    const downloading = await g("https://c.example/trickle", { signal: hangUp.signal });
+    setTimeout(() => hangUp.abort(new Error("client went away")), 100);
+    assert.ok(await elapsed(assert.rejects(downloading.arrayBuffer(), { message: "client went away" })) < 2000);
 
     // Overall deadline: covers waiting for headers and a body that trickles in under the per-chunk timeout.
     const d = guardedFetch({ ...LIMITS, headersTimeoutMs: 5000, bodyTimeoutMs: 5000, deadlineMs: 300 });
@@ -732,6 +744,82 @@ section("oauth", async () => {
   assert.deepEqual((await provider.verifyAccessToken(again.access_token)).extra, { cred });
   await assert.rejects(provider.exchangeRefreshToken(other, tokens.refresh_token), grantError);
   await assert.rejects(provider.exchangeRefreshToken(client, tokens.access_token), grantError);
+});
+
+section("work gate", async () => {
+  // Slots: per credential first, then process-wide.
+  const gate = new WorkGate(3, 2);
+  const res = () => new EventEmitter();
+  const tick = () => new Promise((r) => setImmediate(r));
+  const [a1, a2, b1] = [res(), res(), res()];
+  const w1 = gate.enter("a", a1), w2 = gate.enter("a", a2);
+  assert.equal(gate.enter("a", res()), "credential", "a third request for one credential");
+  gate.enter("b", b1);
+  assert.equal(gate.enter("c", res()), "server", "every slot taken");
+  assert.equal(gate.enter("a", res()), "credential", "the credential's own limit is checked first");
+  assert.equal(gate.inFlight, 3);
+
+  // A client that hangs up: its signal aborts, but the slot stays taken until the work it tracked has settled.
+  let finish;
+  const running = new Promise((r) => (finish = r));
+  assert.equal(w1.track(running), running, "track hands the promise back");
+  assert.equal(w1.signal.aborted, false);
+  a1.emit("close");
+  assert.equal(w1.signal.aborted, true, "closing the response cancels the request's work");
+  await tick();
+  assert.equal(gate.inFlight, 3, "still running after the client left");
+  assert.equal(gate.enter("c", res()), "server", "so another request is still refused");
+  finish();
+  await tick();
+  assert.equal(gate.inFlight, 2, "released once the work settled");
+
+  // Rejected work settles too; work that settled before the response closed holds the slot until it closes.
+  const failing = Promise.reject(new Error("canvas down"));
+  w2.track(failing);
+  await failing.catch(() => {});
+  await tick();
+  assert.equal(gate.inFlight, 2, "the response is still open");
+  a2.emit("close");
+  assert.equal(gate.inFlight, 1);
+  assert.equal(w2.signal.aborted, true);
+
+  // Nothing tracked: released when the response closes. Work started after that changes nothing.
+  const c1 = res(), wc = gate.enter("c", c1);
+  assert.notEqual(wc, "server");
+  c1.emit("close");
+  assert.equal(gate.inFlight, 1);
+  wc.track(Promise.resolve());
+  c1.emit("close");
+  await tick();
+  assert.equal(gate.inFlight, 1, "never released twice");
+  b1.emit("close");
+  assert.equal(gate.inFlight, 0);
+  const again = [gate.enter("a", res()), gate.enter("a", res()), gate.enter("b", res())];
+  assert.ok(again.every((w) => typeof w === "object"), "every slot is free again");
+
+  // buildServer's track hook sees each tool call, from the first Canvas fetch to the finished result.
+  let release;
+  const canvasFetch = () => new Promise((r) => (release = () => r(Response.json([{ id: "101", name: "APUSH", enrollments: [] }]))));
+  const tracked = [];
+  const server = buildServer(new CanvasClient({ baseUrl: "https://yourschool.instructure.com", token: "t", fetch: canvasFetch }),
+    { timeZone: "America/New_York", maxChars: 1000, track: (p) => tracked.push(p) });
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "t", version: "1" });
+  await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
+  assert.equal(tracked.length, 0, "connecting is not a tool call");
+  const call = client.callTool({ name: "list_courses", arguments: {} });
+  for (let i = 0; i < 50 && !release; i++) await tick();
+  assert.equal(tracked.length, 1, "one tool call, one tracked promise");
+  let settled = false;
+  tracked[0].then(() => (settled = true));
+  await tick();
+  assert.equal(settled, false, "pending while Canvas is");
+  release();
+  const result = await call;
+  assert.ok(result.content[0].text.includes("APUSH"));
+  assert.equal(settled, true);
+  assert.equal((await tracked[0]).content[0].text, result.content[0].text, "the tracked promise is the tool's own result");
+  await client.close();
 });
 
 let failed = 0;

@@ -111,6 +111,12 @@ Express app, started by `--http` when `PUBLIC_URL` is set:
 - Rate limits: SDK defaults on OAuth endpoints; `POST /login` 10 per 15 min per IP;
   `/mcp` 120 per minute per student, keyed by a hash of the Canvas credential
   (claude.ai traffic all comes from Anthropic's IPs, so per-IP would be wrong).
+- In-flight `/mcp` work: at most 16 requests in all and 4 per Canvas credential (same hash);
+  beyond that 503 (server) or 429 (credential) with `Retry-After: 5`. A slot is held until the
+  response has closed and the request's tool calls and Canvas fetches have settled; closing the
+  response aborts those fetches. JSON-RPC batches are refused (400), so one slot is one tool call.
+  Remaining risk: anyone can log in against a fake Canvas that answers slowly, and 4 such logins
+  (slowed only by the `/login` limit) keep every slot busy, so other students get 503 meanwhile.
 - `trust proxy` from `TRUST_PROXY` (default `loopback, linklocal, uniquelocal`).
 - Security headers on HTML pages: CSP (`default-src 'none'`, inline style, script by hash,
   `form-action 'self'` plus, on the login page, the origin of the client's redirect URI,

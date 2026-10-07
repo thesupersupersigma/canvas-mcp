@@ -1,10 +1,12 @@
 // Mock Canvas API shared by the integration tests. startMockCanvas(port) → { base, token, close, held, release }.
-// GET /api/v1/courses/999 is held open until release(), so tests can keep requests in flight; held() counts them.
+// GET /api/v1/courses/999 is held open until release(), so tests can keep requests in flight; held() counts the ones
+// whose connection is still open. Besides `token`, any `${token}-<digits>` is accepted, for tests that need several logins.
 import http from "node:http";
 import fs from "node:fs";
 
 const S = new URL("./fixtures", import.meta.url).pathname;
 const TOKEN = "test-token";
+const AUTHORIZED = new RegExp(`^Bearer ${TOKEN}(-\\d+)?$`);
 
 export async function startMockCanvas(port) {
   const base = `http://127.0.0.1:${port}`;
@@ -49,8 +51,12 @@ export async function startMockCanvas(port) {
       res.writeHead(200, { "content-type": "application/octet-stream" }).end(fs.readFileSync(`${S}/${f}`));
       return;
     }
-    if (req.headers.authorization !== `Bearer ${TOKEN}`) { res.writeHead(401).end('{"errors":[{"message":"Invalid access token."}]}'); return; }
-    if (u.pathname === "/api/v1/courses/999") { parked.push(res); return; }
+    if (!AUTHORIZED.test(req.headers.authorization ?? "")) { res.writeHead(401).end('{"errors":[{"message":"Invalid access token."}]}'); return; }
+    if (u.pathname === "/api/v1/courses/999") {
+      parked.push(res);
+      res.on("close", () => parked.includes(res) && parked.splice(parked.indexOf(res), 1));
+      return;
+    }
     const r = routes[u.pathname];
     if (!r) { res.writeHead(404).end('{"errors":[{"message":"The specified resource does not exist."}]}'); return; }
     const headers = { "content-type": "application/json" };

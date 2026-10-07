@@ -1,7 +1,8 @@
 // Multi-user HTTP mode: an OAuth authorization server (claude.ai custom connector) in front of the MCP endpoint.
 // Students log in with their own Canvas URL and token, which travel inside sealed tokens; nothing is stored.
 import { createHash } from "node:crypto";
-import express, { type ErrorRequestHandler, type Express, type Request, type RequestHandler, type Response } from "express";
+import type { EventEmitter } from "node:events";
+import express, { type ErrorRequestHandler, type Express, type Request, type Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
@@ -14,25 +15,62 @@ import { errorPage, landingPage, loginPage, pageHeaders } from "./pages.js";
 import { Sealer } from "./seal.js";
 import { buildServer, VERSION } from "./server.js";
 
-const MAX_IN_FLIGHT = 16; // concurrent /mcp requests, process-wide: each can hold tens of MB of Canvas responses
-const rpcError = (message: string) => ({ jsonrpc: "2.0", error: { code: -32000, message }, id: null });
+// In-flight /mcp work. Each request can hold tens of MB of Canvas responses and extracted text, hence a small
+// process-wide cap; the per-credential cap stops one student, or one fake "Canvas" that answers slowly, from taking every
+// slot. Remaining risk: an attacker who runs a slow fake Canvas and logs in MAX_IN_FLIGHT / MAX_IN_FLIGHT_PER_CRED times
+// (4 logins, which the per-IP /login limit only slows) can still keep every slot busy, so other students get 503.
+const MAX_IN_FLIGHT = 16;
+const MAX_IN_FLIGHT_PER_CRED = 4;
+const rpcError = (message: string, code = -32000) => ({ jsonrpc: "2.0", error: { code, message }, id: null });
 /** The Canvas credential sealed in the bearer token; only after requireBearerAuth. */
 const credOf = (req: Request) => req.auth!.extra!.cred as CanvasCred;
+/** Identifies one Canvas credential (every token issued for it) without keeping the Canvas token itself. */
+const credKey = ({ url, token }: CanvasCred) => createHash("sha256").update(`${url}\n${token}`).digest("base64url");
 const sendPage = (res: Response, status: number, html: string, formActionOrigin?: string) =>
   void res.status(status).set(pageHeaders(formActionOrigin)).type("html").send(html);
 
-/** At most `max` requests past this point at once; the rest get 503 and a hint to retry. */
-function concurrencyGate(max: number): RequestHandler {
-  let inFlight = 0;
-  return (_req, res, next) => {
-    if (inFlight >= max) {
-      res.status(503).set("Retry-After", "5").json(rpcError("Server busy, try again in a few seconds"));
-      return;
-    }
-    inFlight++;
-    res.once("close", () => inFlight--);
-    next();
-  };
+/** One admitted request's work: `signal` aborts when its response closes; tracked promises keep its slot taken. */
+export interface Work {
+  readonly signal: AbortSignal;
+  track<T>(work: Promise<T>): Promise<T>;
+}
+
+/** Slots for in-flight work, at most `max` in all and `maxPerKey` per key. A request keeps its slot until its response
+ *  has closed AND everything it tracked has settled, so a client that hangs up frees nothing while its Canvas fetches
+ *  or file extraction still run; closing the response aborts `signal`, which cancels those fetches. */
+export class WorkGate {
+  private total = 0;
+  private readonly perKey = new Map<string, number>();
+  constructor(private readonly max: number, private readonly maxPerKey: number) {}
+
+  get inFlight(): number { return this.total; }
+
+  /** A slot for `key`, held from now until `res` closes and the tracked work settles; or which limit is in the way. */
+  enter(key: string, res: Pick<EventEmitter, "once">): Work | "credential" | "server" {
+    const mine = this.perKey.get(key) ?? 0;
+    if (mine >= this.maxPerKey) return "credential";
+    if (this.total >= this.max) return "server";
+    this.total++;
+    this.perKey.set(key, mine + 1);
+    const ctl = new AbortController();
+    let pending = 1; // the response itself, until it closes
+    const settle = () => {
+      if (--pending > 0) return;
+      this.total--;
+      const left = this.perKey.get(key)! - 1;
+      if (left) this.perKey.set(key, left);
+      else this.perKey.delete(key);
+    };
+    res.once("close", () => { ctl.abort(); settle(); });
+    return {
+      signal: ctl.signal,
+      track: (work) => {
+        // After the release the signal has fired, so whatever starts now is cancelled at its first fetch.
+        if (pending > 0) { pending++; work.then(settle, settle); }
+        return work;
+      },
+    };
+  }
 }
 
 export function createPublicApp(o: {
@@ -43,6 +81,7 @@ export function createPublicApp(o: {
   const mcpUrl = new URL("/mcp", publicUrl);
   const provider = new StatelessProvider({ sealer: new Sealer(o.key), redirectOrigins: o.redirectOrigins });
   const guardedFetch = createGuardedFetch({ allowPrivate: allowHttp }); // one per process: one undici Agent
+  const gate = new WorkGate(MAX_IN_FLIGHT, MAX_IN_FLIGHT_PER_CRED);
 
   const app = express();
   app.disable("x-powered-by");
@@ -88,18 +127,34 @@ export function createPublicApp(o: {
 
   app.post("/mcp",
     requireBearerAuth({ verifier: provider, resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl) }),
+    (req, res, next) => { res.locals.credKey = credKey(credOf(req)); next(); },
     rateLimit({
       windowMs: 60_000, limit: 120, standardHeaders: true, legacyHeaders: false,
       // Per student, not per IP (claude.ai's requests all come from its servers). Keyed by a hash, never the token.
-      keyGenerator: (req) => { const { url, token } = credOf(req); return createHash("sha256").update(`${url}\n${token}`).digest("base64url"); },
+      keyGenerator: (_req, res) => res.locals.credKey,
       handler: (_req, res) => void res.status(429).json(rpcError("Too many requests, slow down")),
     }),
     express.json({ limit: "1mb" }),
-    concurrencyGate(MAX_IN_FLIGHT),
+    // One message per POST, so one slot is one tool call: a batch could run up to 100 of them (current MCP has no batches).
+    (req, res, next) => Array.isArray(req.body)
+      ? void res.status(400).json(rpcError("Batched JSON-RPC requests aren't supported; send one per request", -32600))
+      : next(),
+    (_req, res, next) => {
+      const work = gate.enter(res.locals.credKey, res);
+      if (work === "credential")
+        return void res.status(429).set("Retry-After", "5").json(rpcError(`At most ${MAX_IN_FLIGHT_PER_CRED} requests at once per Canvas login; wait for one to finish`));
+      if (work === "server") return void res.status(503).set("Retry-After", "5").json(rpcError("Server busy, try again in a few seconds"));
+      res.locals.work = work;
+      next();
+    },
     async (req, res) => {
-      const cred = credOf(req);
+      const cred = credOf(req), work: Work = res.locals.work;
+      // Every Canvas fetch is cancelled when the response closes, and counted until it settles; so is every tool call.
+      const fetch: typeof globalThis.fetch = (input, init) => work.track(guardedFetch(input,
+        { ...init, signal: init?.signal ? AbortSignal.any([init.signal, work.signal]) : work.signal }));
       // A server per request: tools keep a per-server file cache, which must never be shared between students.
-      const server = buildServer(new CanvasClient({ baseUrl: cred.url, token: cred.token, fetch: guardedFetch }), { timeZone: cred.tz, maxChars });
+      const server = buildServer(new CanvasClient({ baseUrl: cred.url, token: cred.token, fetch }),
+        { timeZone: cred.tz, maxChars, track: (call) => void work.track(call) });
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
       res.on("close", () => void Promise.allSettled([transport.close(), server.close()]));
       await server.connect(transport);

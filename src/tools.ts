@@ -6,6 +6,9 @@ import { extractFileText, htmlToText, truncate } from "./extract.js";
 export interface ToolOptions {
   timeZone: string;
   maxChars: number;
+  /** Multi-user mode: handed every tool call's promise (it never rejects), so the server can count the call's work,
+   *  file extraction included, until it is over. */
+  track?: (call: Promise<unknown>) => void;
 }
 
 const courseId = z.union([z.string(), z.number()]).transform(String).describe("Canvas course id (from list_courses)");
@@ -28,8 +31,12 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
     content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 1) }],
   });
   const fail = (e: unknown) => ({ isError: true, content: [{ type: "text" as const, text: String((e as Error)?.message ?? e) }] });
-  const safe = <A,>(fn: (a: A) => Promise<unknown>) => async (a: A) => {
-    try { return ok(await fn(a)); } catch (e) { return fail(e); }
+  const safe = <A,>(fn: (a: A) => Promise<unknown>) => (a: A) => {
+    const call = (async () => {
+      try { return ok(await fn(a)); } catch (e) { return fail(e); }
+    })();
+    opts.track?.(call);
+    return call;
   };
   const ro = { readOnlyHint: true, openWorldHint: true } as const;
 

@@ -258,23 +258,57 @@ try {
   }
   ok("refresh and rejected tokens");
 
-  // At most 16 /mcp requests in flight: the 17th gets 503 with Retry-After, and slots free up when requests finish.
-  const call = (id, init) => rpc({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "get_syllabus", arguments: { course_id: 999 } } }, tokens.access_token, init);
-  const inflight = Array.from({ length: 16 }, (_, i) => call(100 + i));
-  await until("16 requests held at the mock Canvas", () => mock.held() === 16);
-  const busy = await call(200, { signal: AbortSignal.timeout(5000) }); // without the cap it would be held too
-  assert.equal(busy.status, 503);
-  assert.equal(busy.headers.get("retry-after"), "5");
-  const busyBody = await busy.json();
-  assert.equal(busyBody.jsonrpc, "2.0");
-  assert.ok(busyBody.error?.message);
+  // In-flight /mcp work: at most 4 requests per Canvas credential and 16 in all. Refusals come with Retry-After and a JSON-RPC body.
+  // Bearer tokens for Canvas credential n: 0 is the one from the OAuth flow, the others are sealed here for test-token-n.
+  const bearerFor = (n) => n ? sealer.seal("access", { client_id: client.client_id, cred: { url: base, token: `${TOKEN}-${n}`, tz: "UTC" } }, 3600) : tokens.access_token;
+  const call = (bearer, id, init) => rpc({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "get_syllabus", arguments: { course_id: 999 } } }, bearer, init);
+  const fourEach = (creds, firstId, init) => creds.flatMap((n) => Array.from({ length: 4 }, (_, i) => call(bearerFor(n), firstId + n * 4 + i, init)));
+  const held = (n) => until(`${n} requests held at the mock Canvas`, () => mock.held() === n);
+  const refused = async (r, status, why) => {
+    assert.equal(r.status, status, why);
+    assert.equal(r.headers.get("retry-after"), "5", why);
+    const body = await r.json();
+    assert.equal(body.jsonrpc, "2.0", why);
+    assert.ok(body.error?.message, why);
+  };
+  const allHeld = async (responses) => {
+    for (const r of await Promise.all(responses)) {
+      assert.equal(r.status, 200);
+      assert.ok((await r.text()).includes("Held course"));
+    }
+  };
+  const first = fourEach([0], 100);
+  await held(4);
+  // Without the caps these would be held too, hence the timeouts.
+  await refused(await call(next.access_token, 120, { signal: AbortSignal.timeout(5000) }), 429, "a 5th request for one credential, from any of its tokens");
+  const others = fourEach([1, 2, 3], 100);
+  await held(16);
+  await refused(await call(bearerFor(4), 121, { signal: AbortSignal.timeout(5000) }), 503, "the 17th request");
   mock.release();
-  for (const r of await Promise.all(inflight)) {
-    assert.equal(r.status, 200);
-    assert.ok((await r.text()).includes("Held course"));
-  }
+  await allHeld([...first, ...others]);
   assert.equal((await rpc(listTools, tokens.access_token)).status, 200, "slots released");
   ok("concurrency cap");
+
+  // Clients that hang up: their Canvas requests are cancelled, and the slots come back once that work has settled.
+  const hangUp = new AbortController();
+  const abandoned = fourEach([0, 1, 2, 3], 200, { signal: hangUp.signal }).map((p) => p.then(() => "answered", (e) => e.name));
+  await held(16);
+  hangUp.abort();
+  assert.deepEqual([...new Set(await Promise.all(abandoned))], ["AbortError"]);
+  await until("the abandoned Canvas requests to close", () => mock.held() === 0);
+  const resumed = fourEach([0, 1, 2, 3], 300, { signal: AbortSignal.timeout(10_000) });
+  await held(16);
+  mock.release();
+  await allHeld(resumed);
+  ok("hang-up cancels Canvas work");
+
+  // A JSON-RPC batch would put many tool calls behind one slot, so it is refused before anything reaches Canvas.
+  const batch = await rpc([1, 2].map((id) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "get_syllabus", arguments: { course_id: 999 } } })),
+    bearerFor(4), { signal: AbortSignal.timeout(5000) });
+  assert.equal(batch.status, 400);
+  assert.equal((await batch.json()).error?.code, -32600);
+  assert.equal(mock.held(), 0, "nothing reached Canvas");
+  ok("batches refused");
 
   // A body that isn't JSON: a generic 400, and nothing of it in the log (V8's parse error quotes a short body whole).
   const garbled = await rpc('{"t": LEAK9}', tokens.access_token);
