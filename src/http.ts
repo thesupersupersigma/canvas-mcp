@@ -1,9 +1,26 @@
 // Single-user HTTP mode: the MCP endpoint is /mcp/<secret>.
-import { createServer, IncomingMessage } from "node:http";
+import { createServer, IncomingMessage, type Server } from "node:http";
 import { timingSafeEqual } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { VERSION } from "./server.js";
+
+/** For both HTTP modes. `docker stop` sends SIGTERM and kills the process 10 s later, and a Node process running as
+ *  PID 1 has no default handler for it. On SIGTERM or SIGINT: stop accepting connections, give open requests up to
+ *  `graceMs` (dropping each connection once its answer is out), then close whatever is left and exit 0. */
+export function closeOnSignal(server: Server, graceMs = 5000): void {
+  let stopping = false;
+  const stop = (signal: NodeJS.Signals) => {
+    if (stopping) return;
+    stopping = true;
+    console.error(`canvas-mcp: ${signal}, shutting down`);
+    server.close(() => process.exit(0));
+    // close() drops the idle keep-alive connections it finds; a connection whose answer goes out later is idle then.
+    const idle = setInterval(() => server.closeIdleConnections(), 100);
+    setTimeout(() => { clearInterval(idle); server.closeAllConnections(); process.exit(0); }, graceMs);
+  };
+  process.once("SIGTERM", stop).once("SIGINT", stop);
+}
 
 export function startSecretHttp(o: { secret: string; port: number; host: string; baseUrl: string; make: () => McpServer }): void {
   const { port, host } = o;
@@ -20,7 +37,7 @@ export function startSecretHttp(o: { secret: string; port: number; host: string;
       req.on("error", reject);
     });
 
-  createServer(async (req, res) => {
+  const server = createServer(async (req, res) => {
     const path = Buffer.from((req.url ?? "").split("?")[0].replace(/\/+$/, ""));
     if (path.toString() === "/health") { res.writeHead(200).end("ok"); return; }
     if (path.length !== expected.length || !timingSafeEqual(path, expected)) { res.writeHead(404).end(); return; }
@@ -41,7 +58,9 @@ export function startSecretHttp(o: { secret: string; port: number; host: string;
       if (!res.headersSent) res.writeHead(400, { "Content-Type": "application/json" })
         .end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32700, message: "Bad request" }, id: null }));
     }
-  }).listen(port, host, () => {
+  });
+  server.listen(port, host, () => {
     console.error(`canvas-mcp ${VERSION} HTTP on http://${host}:${port}/mcp/<secret>  → ${o.baseUrl}`);
   });
+  closeOnSignal(server);
 }

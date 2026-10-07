@@ -18,6 +18,11 @@ for (const name of envExample.match(/^#?\s*([A-Z][A-Z_]+)=/gm).map((l) => l.repl
   assert.ok(settings.includes(name), `.env.example names ${name}, which the CLI doesn't read`);
 for (const name of ["PUBLIC_URL", "CANVAS_MCP_KEY"]) assert.ok(envExample.includes(`${name}=`), `.env.example has ${name}`);
 
+// The image's health check asks the port the server listens on (CANVAS_MCP_PORT, read when the check runs), not a fixed one.
+const healthcheck = read("Dockerfile").match(/^HEALTHCHECK .*$/m)?.[0] ?? "";
+assert.match(healthcheck, /http:\/\/127\.0\.0\.1:\$\{CANVAS_MCP_PORT:-7341\}\/health/, `Dockerfile: ${healthcheck}`);
+assert.doesNotMatch(healthcheck, /\[/, "shell form (exec form would not expand the variable)");
+
 // No real school: every example Canvas host is the placeholder.
 for (const [doc, text] of [["--help", help], ["README.md", readme], [".env.example", envExample], ["src", sources.join("\n")]])
   for (const [host] of text.matchAll(/[\w.-]+\.instructure\.com/g))

@@ -23,20 +23,22 @@ const baseEnv = { ...process.env };
 for (const k of ["MCP_SECRET", "PUBLIC_URL", "CANVAS_MCP_KEY", "CANVAS_MCP_REDIRECT_HOSTS", "TRUST_PROXY", "CANVAS_MCP_ALLOW_PRIVATE_NETWORK",
   "CANVAS_BASE_URL", "CANVAS_URL", "CANVAS_API_TOKEN", "CANVAS_TOKEN"]) delete baseEnv[k];
 
-/** Runs the CLI with `env` until it exits (it must, within 5 s). */
+/** Runs the CLI with `env` until it exits (it must, within 5 s); `.child` is the process. */
 function runCli(args, env) {
-  return new Promise((resolve, reject) => {
-    const p = spawn("node", ["dist/index.js", ...args], { env: { ...baseEnv, ...env } });
+  let child;
+  const exited = new Promise((resolve, reject) => {
+    const p = child = spawn("node", ["dist/index.js", ...args], { env: { ...baseEnv, ...env } });
     let stderr = "";
     p.stderr.on("data", (d) => (stderr += d));
     const t = setTimeout(() => { p.kill(); reject(new Error(`CLI did not exit: ${stderr}`)); }, 5000);
     p.on("exit", (code) => { clearTimeout(t); resolve({ code, stderr }); });
   });
+  return Object.assign(exited, { child });
 }
 
 const mock = await startMockCanvas(4558);
 const { base, token: TOKEN } = mock;
-let srv, stdioClient, mcp;
+let srv, stdioClient, mcp, many, manyClient;
 let stderr = "";
 const checks = [];
 const ok = (name) => checks.push(name);
@@ -62,10 +64,20 @@ try {
   }
   ok("startup config errors");
 
+  // Ctrl+C (SIGINT) stops the server cleanly too.
+  const interrupted = runCli(["--http", "--port", "4559"], pub);
+  await until("the server on 4559", async () => { try { return (await fetch("http://127.0.0.1:4559/health")).ok; } catch { return false; } });
+  interrupted.child.kill("SIGINT");
+  const stoppedByCtrlC = await interrupted;
+  assert.equal(stoppedByCtrlC.code, 0, stoppedByCtrlC.stderr);
+  assert.ok(stoppedByCtrlC.stderr.includes("canvas-mcp: SIGINT, shutting down"), stoppedByCtrlC.stderr);
+  ok("SIGINT");
+
   srv = spawn("node", ["dist/index.js", "--http", "--port", String(PORT)],
     { env: { ...baseEnv, PUBLIC_URL: `${ORIGIN}/`, CANVAS_MCP_KEY: KEY, CANVAS_MCP_ALLOW_PRIVATE_NETWORK: "1" } });
   srv.stderr.on("data", (d) => (stderr += d));
   let exited = false;
+  const exit = new Promise((resolve) => srv.on("exit", (code, signal) => resolve({ code, signal })));
   srv.on("exit", () => (exited = true));
   await until("the server's /health", async () => {
     if (exited) throw new Error(`server exited: ${stderr}`);
@@ -238,6 +250,36 @@ try {
   assert.equal(limited.headers.get("ratelimit-limit"), "120", "/mcp: 120 per minute");
   ok("MCP over OAuth");
 
+  // A file whose zip contents inflate past the cap (17 kB on the wire, 17 MiB inflated) is a tool error; the server carries on.
+  for (const file_id of ["903", "904"]) {
+    const bomb = await mcp.callTool({ name: "read_file", arguments: { file_id } });
+    assert.ok(bomb.isError, file_id);
+    assert.equal(bomb.content[0].text, "File is too large to read here.", file_id);
+  }
+  assert.equal(await (await fetch(`${ORIGIN}/health`)).text(), "ok");
+  assert.ok((await mcp.callTool({ name: "read_file", arguments: { file_id: "901" } })).content[0].text.includes("--- Slide 1 ---"), "a real .pptx still reads");
+  ok("zip bombs refused");
+
+  // One request's Canvas work has a budget. get_calendar over a Canvas with 1,000 courses needs 110 fetches (10 pages of
+  // courses, then 100 batches of events): the 101st is refused before it leaves, and the next request starts afresh.
+  // An API page over 16 MiB is refused on its own (stdio mode reads it).
+  many = await startMockCanvas(4560, { courses: 1000 });
+  manyClient = new Client({ name: "t", version: "1" });
+  const manyBearer = sealer.seal("access", { client_id: client.client_id, cred: { url: many.base, token: TOKEN, tz: "UTC" } }, 3600);
+  await manyClient.connect(new StreamableHTTPClientTransport(new URL(`${ORIGIN}/mcp`), { requestInit: { headers: { Authorization: `Bearer ${manyBearer}` } } }));
+  const calendar = await manyClient.callTool({ name: "get_calendar", arguments: {} });
+  assert.ok(calendar.isError);
+  assert.equal(calendar.content[0].text, "This request needed too much data from Canvas.");
+  assert.equal(many.requests(), 100, "exactly 100 fetches reached Canvas");
+  const manyCourses = await manyClient.callTool({ name: "list_courses", arguments: {} });
+  assert.ok(!manyCourses.isError && manyCourses.content[0].text.includes("Course 1000"), "the next request has a budget of its own");
+  const hugePage = await mcp.callTool({ name: "list_pages", arguments: { course_id: "104" } });
+  assert.ok(hugePage.isError);
+  assert.match(hugePage.content[0].text, /more than 16 MB/);
+  const hugeLocally = await stdioClient.callTool({ name: "list_pages", arguments: { course_id: "104" } });
+  assert.ok(!hugeLocally.isError && hugeLocally.content[0].text.includes("Huge"), "no page cap in stdio mode");
+  ok("request budget");
+
   // Refresh, and tokens that must not work.
   const refreshed = await token({ grant_type: "refresh_token", refresh_token: tokens.refresh_token });
   assert.equal(refreshed.status, 200);
@@ -258,11 +300,13 @@ try {
   }
   ok("refresh and rejected tokens");
 
-  // In-flight /mcp work: at most 4 requests per Canvas credential and 16 in all. Refusals come with Retry-After and a JSON-RPC body.
+  // In-flight /mcp work: at most 6 requests per Canvas credential and 16 in all. Refusals come with Retry-After and a JSON-RPC body.
   // Bearer tokens for Canvas credential n: 0 is the one from the OAuth flow, the others are sealed here for test-token-n.
   const bearerFor = (n) => n ? sealer.seal("access", { client_id: client.client_id, cred: { url: base, token: `${TOKEN}-${n}`, tz: "UTC" } }, 3600) : tokens.access_token;
   const call = (bearer, id, init) => rpc({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "get_syllabus", arguments: { course_id: 999 } } }, bearer, init);
-  const fourEach = (creds, firstId, init) => creds.flatMap((n) => Array.from({ length: 4 }, (_, i) => call(bearerFor(n), firstId + n * 4 + i, init)));
+  const hold = (n, count, firstId, init) => Array.from({ length: count }, (_, i) => call(bearerFor(n), firstId + i, init));
+  // 16 requests held at once: 6 + 6 + 4 from credentials 0, 1 and 2.
+  const sixteen = (firstId, init) => [...hold(0, 6, firstId, init), ...hold(1, 6, firstId + 6, init), ...hold(2, 4, firstId + 12, init)];
   const held = (n) => until(`${n} requests held at the mock Canvas`, () => mock.held() === n);
   const refused = async (r, status, why) => {
     assert.equal(r.status, status, why);
@@ -277,13 +321,13 @@ try {
       assert.ok((await r.text()).includes("Held course"));
     }
   };
-  const first = fourEach([0], 100);
-  await held(4);
+  const first = hold(0, 6, 100);
+  await held(6);
   // Without the caps these would be held too, hence the timeouts.
-  await refused(await call(next.access_token, 120, { signal: AbortSignal.timeout(5000) }), 429, "a 5th request for one credential, from any of its tokens");
-  const others = fourEach([1, 2, 3], 100);
+  await refused(await call(next.access_token, 120, { signal: AbortSignal.timeout(5000) }), 429, "a 7th request for one credential, from any of its tokens");
+  const others = [...hold(1, 6, 106), ...hold(2, 4, 112)];
   await held(16);
-  await refused(await call(bearerFor(4), 121, { signal: AbortSignal.timeout(5000) }), 503, "the 17th request");
+  await refused(await call(bearerFor(3), 121, { signal: AbortSignal.timeout(5000) }), 503, "the 17th request");
   mock.release();
   await allHeld([...first, ...others]);
   assert.equal((await rpc(listTools, tokens.access_token)).status, 200, "slots released");
@@ -291,29 +335,43 @@ try {
 
   // Clients that hang up: their Canvas requests are cancelled, and the slots come back once that work has settled.
   const hangUp = new AbortController();
-  const abandoned = fourEach([0, 1, 2, 3], 200, { signal: hangUp.signal }).map((p) => p.then(() => "answered", (e) => e.name));
+  const abandoned = sixteen(200, { signal: hangUp.signal }).map((p) => p.then(() => "answered", (e) => e.name));
   await held(16);
   hangUp.abort();
   assert.deepEqual([...new Set(await Promise.all(abandoned))], ["AbortError"]);
   await until("the abandoned Canvas requests to close", () => mock.held() === 0);
-  const resumed = fourEach([0, 1, 2, 3], 300, { signal: AbortSignal.timeout(10_000) });
+  const resumed = sixteen(300, { signal: AbortSignal.timeout(10_000) });
   await held(16);
   mock.release();
   await allHeld(resumed);
   ok("hang-up cancels Canvas work");
 
-  // A JSON-RPC batch would put many tool calls behind one slot, so it is refused before anything reaches Canvas.
-  const batch = await rpc([1, 2].map((id) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "get_syllabus", arguments: { course_id: 999 } } })),
-    bearerFor(4), { signal: AbortSignal.timeout(5000) });
-  assert.equal(batch.status, 400);
-  assert.equal((await batch.json()).error?.code, -32600);
+  // JSON-RPC batches of 1 to 8 messages run in one slot, on one budget; bigger or empty ones are refused before anything
+  // reaches Canvas.
+  const batch = (n, course_id = 102) => Array.from({ length: n }, (_, i) => ({ jsonrpc: "2.0", id: i + 1, method: "tools/call", params: { name: "get_syllabus", arguments: { course_id } } }));
+  for (const n of [2, 8]) {
+    const answered = await rpc(batch(n), bearerFor(4));
+    assert.equal(answered.status, 200, `a batch of ${n}`);
+    const answers = await answered.json();
+    assert.deepEqual(answers.map((a) => a.id).sort((a, b) => a - b), batch(n).map((m) => m.id), `${n} answers`);
+    assert.ok(answers.every((a) => !a.result.isError && a.result.content[0].text.includes("Tests are")), `a batch of ${n}`);
+  }
+  for (const n of [9, 0]) {
+    const r = await rpc(batch(n, 999), bearerFor(4), { signal: AbortSignal.timeout(5000) });
+    assert.equal(r.status, 400, `a batch of ${n}`);
+    assert.equal((await r.json()).error?.code, -32600, `a batch of ${n}`);
+  }
   assert.equal(mock.held(), 0, "nothing reached Canvas");
-  ok("batches refused");
+  ok("batches of up to 8");
 
   // A body that isn't JSON: a generic 400, and nothing of it in the log (V8's parse error quotes a short body whole).
   const garbled = await rpc('{"t": LEAK9}', tokens.access_token);
   assert.equal(garbled.status, 400);
   assert.ok(!(await garbled.text()).includes("LEAK9"));
+  // Bodies up to 256 kB.
+  const padded = (n) => ({ ...listTools, params: { _meta: { pad: "x".repeat(n) } } });
+  assert.equal((await rpc(padded(200_000), bearerFor(4))).status, 200, "200 kB");
+  assert.equal((await rpc(padded(300_000), bearerFor(4))).status, 413, "300 kB");
 
   // The /mcp limit is per Canvas credential, not per IP: the same Canvas reached as "localhost" is another credential.
   const authreq2 = await authorize(client);
@@ -350,11 +408,31 @@ try {
   for (const secret of [TOKEN, tokens.access_token, tokens.refresh_token, next.access_token, code, "LEAK9", authreq])
     assert.ok(!stderr.includes(secret), `log leaks ${secret.slice(0, 12)}…`);
   ok("log is clean");
+
+  // SIGTERM (docker stop): no new connections, an open request still gets its answer, then exit 0 at once, well inside
+  // the 10 s docker waits before SIGKILL.
+  const open = call(bearerFor(5), 900);
+  open.catch(() => {}); // awaited below; a failure must not crash the run before then
+  await held(1);
+  const stopped = Date.now();
+  srv.kill("SIGTERM");
+  await until("the server to stop accepting connections", async () => {
+    try { await fetch(`${ORIGIN}/health`); return false; } catch { return true; }
+  });
+  mock.release();
+  const answer = await open;
+  assert.equal(answer.status, 200);
+  assert.ok((await answer.text()).includes("Held course"), "the open request was answered");
+  assert.deepEqual(await exit, { code: 0, signal: null });
+  assert.ok(Date.now() - stopped < 3000, `exited ${Date.now() - stopped} ms after SIGTERM, without waiting out the grace period`);
+  ok("SIGTERM");
 } finally {
   console.log(`[oauth] ${checks.length} checks passed: ${checks.join(", ")}`);
   await mcp?.close().catch(() => {});
+  await manyClient?.close().catch(() => {});
   await stdioClient?.close().catch(() => {});
   srv?.kill();
   mock.release();
   await mock.close();
+  await many?.close();
 }

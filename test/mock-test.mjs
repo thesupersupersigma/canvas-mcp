@@ -61,6 +61,23 @@ try {
   assert.equal(wrong.status, 404);
   assert.equal(health, 200);
   await h.close();
+
+  // SIGTERM (docker stop) while a request is stuck at Canvas: the server gives it a few seconds, then closes it and
+  // exits 0, before the 10 s docker waits ahead of SIGKILL.
+  const exit = new Promise((resolve) => srv.on("exit", (code, signal) => resolve({ code, signal })));
+  const stuck = fetch(`http://127.0.0.1:4556/mcp/${secret}`, {
+    method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "get_syllabus", arguments: { course_id: 999 } } }),
+  }).then(() => "answered", () => "cut off");
+  for (const end = Date.now() + 5000; mock.held() < 1; await new Promise((r) => setTimeout(r, 20)))
+    if (Date.now() > end) throw new Error("the request never reached the mock Canvas");
+  const stopped = Date.now();
+  srv.kill("SIGTERM");
+  assert.deepEqual(await exit, { code: 0, signal: null });
+  const took = Date.now() - stopped;
+  assert.ok(took < 9000, `exited ${took} ms after SIGTERM`);
+  assert.equal(await stuck, "cut off");
+  results.push(`\n[http] SIGTERM with a request stuck at Canvas -> exit 0 after ${took} ms`);
 } finally {
   console.log(results.join("\n"));
   srv?.kill();

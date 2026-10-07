@@ -111,12 +111,19 @@ Express app, started by `--http` when `PUBLIC_URL` is set:
 - Rate limits: SDK defaults on OAuth endpoints; `POST /login` 10 per 15 min per IP;
   `/mcp` 120 per minute per student, keyed by a hash of the Canvas credential
   (claude.ai traffic all comes from Anthropic's IPs, so per-IP would be wrong).
-- In-flight `/mcp` work: at most 16 requests in all and 4 per Canvas credential (same hash);
+- In-flight `/mcp` work: at most 16 requests in all and 6 per Canvas credential (same hash);
   beyond that 503 (server) or 429 (credential) with `Retry-After: 5`. A slot is held until the
   response has closed and the request's tool calls and Canvas fetches have settled; closing the
-  response aborts those fetches. JSON-RPC batches are refused (400), so one slot is one tool call.
-  Remaining risk: anyone can log in against a fake Canvas that answers slowly, and 4 such logins
+  response aborts those fetches. A JSON-RPC batch of 1 to 8 messages runs in one slot on one
+  budget; a bigger or empty batch is refused (400, -32600).
+- Per-request budget: one `POST /mcp` makes at most 100 Canvas fetches, reads at most 96 MiB of
+  response bodies (counted after decoding) and 16 MiB per API page (file downloads keep the
+  guard's 60 MiB), and its fetches are cancelled after 120 s; past that, the tool call fails with
+  "This request needed too much data from Canvas." DOCX and PPTX files inflate to at most 16 MiB
+  per zip entry and 64 MiB per file ("File is too large to read here.").
+  Remaining risk: anyone can log in against a fake Canvas that answers slowly, and 3 such logins
   (slowed only by the `/login` limit) keep every slot busy, so other students get 503 meanwhile.
+  A fake Canvas can also fill a request's 96 MiB with JSON that parses to many times its size.
 - `trust proxy` from `TRUST_PROXY` (default `loopback, linklocal, uniquelocal`).
 - Security headers on HTML pages: CSP (`default-src 'none'`, inline style, script by hash,
   `form-action 'self'` plus, on the login page, the origin of the client's redirect URI,
@@ -124,7 +131,9 @@ Express app, started by `--http` when `PUBLIC_URL` is set:
   form's own POST carries `Origin: null`, which any page can send). `POST /login` is refused
   (403) unless it comes from the login page itself: `Sec-Fetch-Site: same-origin`, or, from a
   browser that sends no `Sec-Fetch-Site`, `Origin` equal to the server's own origin.
-- All reflected values HTML-escaped. Body size limits (login 10 kB, MCP 1 MB).
+- All reflected values HTML-escaped. Body size limits (login 10 kB, MCP 256 kB).
+- SIGTERM or SIGINT (both HTTP modes): stop accepting connections, give open requests up to 5 s,
+  then exit 0, inside the 10 s `docker stop` waits before SIGKILL.
 - Logging: errors only, never tokens, request bodies, or Authorization headers.
 
 ## Configuration

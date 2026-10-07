@@ -8,6 +8,7 @@ import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middlew
 import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CanvasClient } from "./canvas.js";
+import { closeOnSignal } from "./http.js";
 import { CanvasCred, isSameOriginPost, normalizeCanvasUrl, normalizeTimeZone, verifyCanvasLogin } from "./login.js";
 import { createGuardedFetch } from "./netguard.js";
 import { StatelessProvider } from "./oauth.js";
@@ -15,12 +16,27 @@ import { errorPage, landingPage, loginPage, pageHeaders } from "./pages.js";
 import { Sealer } from "./seal.js";
 import { buildServer, VERSION } from "./server.js";
 
-// In-flight /mcp work. Each request can hold tens of MB of Canvas responses and extracted text, hence a small
-// process-wide cap; the per-credential cap stops one student, or one fake "Canvas" that answers slowly, from taking every
-// slot. Remaining risk: an attacker who runs a slow fake Canvas and logs in MAX_IN_FLIGHT / MAX_IN_FLIGHT_PER_CRED times
-// (4 logins, which the per-IP /login limit only slows) can still keep every slot busy, so other students get 503.
+// In-flight /mcp work. Each request can hold up to REQUEST_BUDGET.bytes of Canvas responses plus extracted text, hence
+// a small process-wide cap; the per-credential cap stops one student, or one fake "Canvas" that answers slowly, from
+// taking every slot. Remaining risk: an attacker who runs a slow fake Canvas and logs in 3 times (16 / 6, rounded up;
+// the per-IP /login limit only slows that) can still keep every slot busy, so other students get 503.
 const MAX_IN_FLIGHT = 16;
-const MAX_IN_FLIGHT_PER_CRED = 4;
+const MAX_IN_FLIGHT_PER_CRED = 6;
+/** Messages in one JSON-RPC batch; the batch shares its request's slot and budget (the SDK alone would take 100). */
+const MAX_BATCH = 8;
+const MiB = 1024 * 1024;
+/** What one POST /mcp may ask of Canvas, over all of its tool calls: the slots cap how many requests run at once, this
+ *  caps what each one does. Past it, the fetch that would cross it fails with BudgetError. */
+export const REQUEST_BUDGET = Object.freeze({
+  fetches: 100, // Canvas requests (get_calendar over every course makes one per 10 courses)
+  bytes: 96 * MiB, // response bodies, counted after decoding
+  ms: 120_000, // from admission; then every Canvas fetch still running is cancelled
+  pageBytes: 16 * MiB, // one API (JSON) response, as CanvasClient's maxJsonBytes; file downloads keep the guard's 60 MiB
+});
+export class BudgetError extends Error {
+  name = "BudgetError";
+  constructor() { super("This request needed too much data from Canvas."); }
+}
 const rpcError = (message: string, code = -32000) => ({ jsonrpc: "2.0", error: { code, message }, id: null });
 /** The Canvas credential sealed in the bearer token; only after requireBearerAuth. */
 const credOf = (req: Request) => req.auth!.extra!.cred as CanvasCred;
@@ -45,8 +61,10 @@ export class WorkGate {
 
   get inFlight(): number { return this.total; }
 
-  /** A slot for `key`, held from now until `res` closes and the tracked work settles; or which limit is in the way. */
-  enter(key: string, res: Pick<EventEmitter, "once">): Work | "credential" | "server" {
+  /** A slot for `key`, held from now until `res` closes and the tracked work settles; or which limit is in the way.
+   *  A response that has already closed (its client hung up while the body was read) won't emit "close" again, so its
+   *  slot is released at once and its signal starts out aborted. */
+  enter(key: string, res: Pick<EventEmitter, "once"> & { closed?: boolean; destroyed?: boolean }): Work | "credential" | "server" {
     const mine = this.perKey.get(key) ?? 0;
     if (mine >= this.maxPerKey) return "credential";
     if (this.total >= this.max) return "server";
@@ -61,7 +79,10 @@ export class WorkGate {
       if (left) this.perKey.set(key, left);
       else this.perKey.delete(key);
     };
-    res.once("close", () => { ctl.abort(); settle(); });
+    let open = true;
+    const close = () => { if (open) { open = false; ctl.abort(); settle(); } };
+    res.once("close", close);
+    if (res.closed || res.destroyed) close();
     return {
       signal: ctl.signal,
       track: (work) => {
@@ -71,6 +92,38 @@ export class WorkGate {
       },
     };
   }
+}
+
+/** The fetch for one admitted request's Canvas work: cancelled when its response closes or its time is up, every call
+ *  tracked by its slot, and refused with BudgetError past the budget's fetch count or total of body bytes. */
+export function budgetedFetch(fetch: typeof globalThis.fetch, work: Work, budget = REQUEST_BUDGET): typeof globalThis.fetch {
+  const timeUp = new AbortController();
+  const timer = setTimeout(() => timeUp.abort(new BudgetError()), budget.ms);
+  const stop = () => clearTimeout(timer);
+  if (work.signal.aborted) stop();
+  else work.signal.addEventListener("abort", stop, { once: true });
+  const signal = AbortSignal.any([work.signal, timeUp.signal]);
+  let fetches = 0, bytes = 0;
+  const count = (n: number) => { if ((bytes += n) > budget.bytes) throw new BudgetError(); };
+  return async (input, init) => {
+    if (++fetches > budget.fetches) throw new BudgetError();
+    const res = await work.track(fetch(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal }));
+    return metered(res, count);
+  };
+}
+
+type FetchResponse = Awaited<ReturnType<typeof globalThis.fetch>>; // `Response` here is Express's
+
+/** `res` with every body chunk passed to `count` on its way through; a throw from `count` fails the read and cancels
+ *  the source body. */
+function metered(res: FetchResponse, count: (bytes: number) => void): FetchResponse {
+  if (!res.body) return res;
+  const body = res.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) { count(chunk.byteLength); controller.enqueue(chunk); },
+  }));
+  const out = new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+  Object.defineProperty(out, "url", { value: res.url });
+  return out;
 }
 
 export function createPublicApp(o: {
@@ -134,10 +187,10 @@ export function createPublicApp(o: {
       keyGenerator: (_req, res) => res.locals.credKey,
       handler: (_req, res) => void res.status(429).json(rpcError("Too many requests, slow down")),
     }),
-    express.json({ limit: "1mb" }),
-    // One message per POST, so one slot is one tool call: a batch could run up to 100 of them (current MCP has no batches).
-    (req, res, next) => Array.isArray(req.body)
-      ? void res.status(400).json(rpcError("Batched JSON-RPC requests aren't supported; send one per request", -32600))
+    express.json({ limit: "256kb" }),
+    // A batch runs all its tool calls at once in one slot, on one budget; MCP 2025-03-26 clients may send them.
+    (req, res, next) => Array.isArray(req.body) && (req.body.length === 0 || req.body.length > MAX_BATCH)
+      ? void res.status(400).json(rpcError(`A JSON-RPC batch must hold 1 to ${MAX_BATCH} messages`, -32600))
       : next(),
     (_req, res, next) => {
       const work = gate.enter(res.locals.credKey, res);
@@ -149,12 +202,12 @@ export function createPublicApp(o: {
     },
     async (req, res) => {
       const cred = credOf(req), work: Work = res.locals.work;
-      // Every Canvas fetch is cancelled when the response closes, and counted until it settles; so is every tool call.
-      const fetch: typeof globalThis.fetch = (input, init) => work.track(guardedFetch(input,
-        { ...init, signal: init?.signal ? AbortSignal.any([init.signal, work.signal]) : work.signal }));
+      // Every Canvas fetch is cancelled when the response closes or the budget's time is up, counted until it settles,
+      // and within the request's budget; every tool call is counted until it settles too.
+      const fetch = budgetedFetch(guardedFetch, work);
       // A server per request: tools keep a per-server file cache, which must never be shared between students.
-      const server = buildServer(new CanvasClient({ baseUrl: cred.url, token: cred.token, fetch }),
-        { timeZone: cred.tz, maxChars, track: (call) => void work.track(call) });
+      const canvas = new CanvasClient({ baseUrl: cred.url, token: cred.token, fetch, maxJsonBytes: REQUEST_BUDGET.pageBytes });
+      const server = buildServer(canvas, { timeZone: cred.tz, maxChars, track: (call) => void work.track(call) });
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
       res.on("close", () => void Promise.allSettled([transport.close(), server.close()]));
       await server.connect(transport);
@@ -176,8 +229,8 @@ export function createPublicApp(o: {
 }
 
 export function startPublicHttp(app: Express, port: number, host: string): void {
-  app.listen(port, host, (err?: Error) => {
+  closeOnSignal(app.listen(port, host, (err?: Error) => {
     if (err) { console.error(`canvas-mcp: can't listen on ${host}:${port}: ${err.message}`); process.exit(1); }
     console.error(`canvas-mcp ${VERSION} multi-user HTTP on http://${host}:${port}`);
-  });
+  }));
 }

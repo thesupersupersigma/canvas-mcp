@@ -10,13 +10,15 @@ import zlib from "node:zlib";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { CanvasClient } from "../dist/canvas.js";
+import { extractFileText, ZIP_LIMITS } from "../dist/extract.js";
 import { isSameOriginPost, normalizeCanvasUrl, normalizeTimeZone, verifyCanvasLogin } from "../dist/login.js";
 import * as netguard from "../dist/netguard.js";
 import { DEFAULT_REDIRECT_ORIGINS, parseRedirectOrigins, redirectAllowed, StatelessProvider } from "../dist/oauth.js";
 import { errorPage, escapeHtml, landingPage, loginPage, pageHeaders } from "../dist/pages.js";
-import { WorkGate } from "../dist/public.js";
+import { budgetedFetch, REQUEST_BUDGET, WorkGate } from "../dist/public.js";
 import { Sealer } from "../dist/seal.js";
 import { buildServer } from "../dist/server.js";
+import { makeDocx, makePptx, makeZip, slideXml } from "./make-zip.mjs";
 
 const { _testing, createGuardedFetch, isPublicAddress, NetGuardError } = netguard;
 const { guardedFetch, guardedLookup, LIMITS, withUrlGuard } = _testing;
@@ -797,6 +799,20 @@ section("work gate", async () => {
   const again = [gate.enter("a", res()), gate.enter("a", res()), gate.enter("b", res())];
   assert.ok(again.every((w) => typeof w === "object"), "every slot is free again");
 
+  // A response that closed before it got a slot (its client hung up while the body was being read) will never emit
+  // "close" again: it holds nothing, and a late "close" from a socket still being destroyed releases nothing twice.
+  const fresh = new WorkGate(3, 2);
+  for (const flags of [{ closed: true }, { destroyed: true }]) {
+    const gone = Object.assign(res(), flags);
+    const w = fresh.enter("a", gone);
+    assert.equal(typeof w, "object", JSON.stringify(flags));
+    assert.equal(w.signal.aborted, true, "its work is cancelled from the start");
+    assert.equal(fresh.inFlight, 0, "and its slot is already free");
+    gone.emit("close");
+    assert.equal(fresh.inFlight, 0, "released once only");
+  }
+  assert.ok([fresh.enter("a", res()), fresh.enter("a", res())].every((w) => typeof w === "object"), "the credential's slots are all there");
+
   // buildServer's track hook sees each tool call, from the first Canvas fetch to the finished result.
   let release;
   const canvasFetch = () => new Promise((r) => (release = () => r(Response.json([{ id: "101", name: "APUSH", enrollments: [] }]))));
@@ -820,6 +836,128 @@ section("work gate", async () => {
   assert.equal(settled, true);
   assert.equal((await tracked[0]).content[0].text, result.content[0].text, "the tracked promise is the tool's own result");
   await client.close();
+});
+
+section("extract", async () => {
+  // Zip contents (PPTX slides, DOCX parts) are inflated within ZIP_LIMITS, counted after decompression: a few kB of
+  // deflate can stand for gigabytes. Past them read_file gets a clean error, and nothing more is inflated.
+  const MiB = 1024 * 1024;
+  assert.deepEqual({ ...ZIP_LIMITS }, { entryBytes: 16 * MiB, totalBytes: 64 * MiB });
+  assert.ok(Object.isFrozen(ZIP_LIMITS));
+  const read = async (bytes, name) => (await extractFileText(new Uint8Array(bytes), name, "")).text;
+  const tooLarge = { message: "File is too large to read here." };
+  const spaces = (n) => Buffer.alloc(n, 0x20);
+  const slide = (n) => `ppt/slides/slide${n}.xml`;
+
+  // Ordinary files read as before, zip64 ones too.
+  for (const zip64 of [false, true]) {
+    assert.equal(await read(makePptx(["Hello", "Two &amp; three"], { zip64 }), "s.pptx"), "--- Slide 1 ---\nHello\n\n--- Slide 2 ---\nTwo & three", `pptx, zip64 ${zip64}`);
+    assert.equal(await read(makeDocx(["First", "Second &amp; last"], { zip64 }), "d.docx"), "First\n\nSecond & last", `docx, zip64 ${zip64}`);
+  }
+
+  // One entry past 16 MiB is refused: a slide (deflated or stored), or any part the docx reader opens.
+  const atCap = Buffer.concat([slideXml("At the cap"), spaces(16 * MiB - slideXml("At the cap").length)]);
+  assert.equal(await read(makeZip([[slide(1), atCap]]), "s.pptx"), "--- Slide 1 ---\nAt the cap", "exactly 16 MiB is fine");
+  await assert.rejects(read(makeZip([[slide(1), spaces(16 * MiB + 1)]]), "s.pptx"), tooLarge);
+  await assert.rejects(read(makeZip([[slide(1), spaces(16 * MiB + 1), { store: true }]]), "s.pptx"), tooLarge, "stored");
+  await assert.rejects(read(makeDocx([], { document: spaces(16 * MiB + 1) }), "d.docx"), tooLarge, "the document");
+  await assert.rejects(read(makeDocx(["Hi"], { more: [["word/styles.xml", spaces(16 * MiB + 1)]] }), "d.docx"), tooLarge, "styles");
+  // 64 MiB over the whole file: five 15 MiB slides are refused, though each is under the per-entry cap.
+  const fifteen = spaces(15 * MiB);
+  await assert.rejects(read(makeZip([1, 2, 3, 4, 5].map((n) => [slide(n), fifteen])), "s.pptx"), tooLarge);
+  // Parts the docx reader never opens (pictures) are never inflated: this one would be refused if it were.
+  assert.equal(await read(makeDocx(["Photo essay"], { more: [["word/media/image1.png", spaces(16 * MiB + 1)]] }), "d.docx"), "Photo essay");
+  // Overlapping entries: a thousand central-directory entries for one 10 MiB stream are one slide, inflated once
+  // (inflating it for every entry would pass the 64 MiB total).
+  const once = Buffer.concat([slideXml("Once"), spaces(10 * MiB)]);
+  const overlapping = makeZip([[slide(1), once], ...Array.from({ length: 1000 }, (_, i) => [slide(i + 2), { sameAs: slide(1) }])]);
+  assert.equal(await read(overlapping, "s.pptx"), "--- Slide 1 ---\nOnce");
+
+  // Damaged files: a clean error, never a RangeError from reading past the end.
+  const good = makePptx(["x"]), end = good.length - 22, cd = good.readUInt32LE(end + 16);
+  const patched = (offset, value, bytes = 4) => { const b = Buffer.from(good); b.writeUIntLE(value, offset, bytes); return b; };
+  for (const [bad, why] of [[Buffer.from("not a zip"), "no end record"], [good.subarray(0, good.length - 30), "cut short"],
+    [patched(end + 16, 0x7fffffff), "central directory past the end"], [patched(end + 16, 0), "central directory offset wrong"],
+    [patched(cd + 42, 0x7fffffff), "local header past the end"], [patched(cd + 10, 12, 2), "unknown compression method"],
+    [patched(30 + slide(1).length, 0xffffffff), "deflate data damaged"]])
+    await assert.rejects(read(bad, "s.pptx"), { message: "Not a valid pptx file" }, why);
+  await assert.rejects(read(Buffer.from("not a zip"), "d.docx"), { message: "Not a valid docx file" });
+});
+
+section("request budget", async () => {
+  // What one POST /mcp may ask of Canvas, over all of its tool calls: 100 fetches, 96 MiB of bodies, 120 s; and 16 MiB
+  // for one API page (CanvasClient's maxJsonBytes; file downloads keep the guard's 60 MiB).
+  const MiB = 1024 * 1024;
+  assert.deepEqual({ ...REQUEST_BUDGET }, { fetches: 100, bytes: 96 * MiB, ms: 120_000, pageBytes: 16 * MiB });
+  assert.ok(Object.isFrozen(REQUEST_BUDGET));
+  const needed = { name: "BudgetError", message: "This request needed too much data from Canvas." };
+  const gate = new WorkGate(16, 16);
+  const open = [];
+  const admit = () => { const res = new EventEmitter(); open.push(res); return [res, gate.enter("k", res)]; };
+  const tick = () => new Promise((r) => setImmediate(r));
+
+  // Fetches: counted per request; the one past the budget never reaches the network. Responses come through whole.
+  let calls = 0;
+  const page = async () => (calls++, new Response("ok", { status: 203, statusText: "Fine", headers: { "x-page": "1" } }));
+  const f1 = budgetedFetch(page, admit()[1], { ...REQUEST_BUDGET, fetches: 3 });
+  for (let i = 0; i < 3; i++) {
+    const r = await f1("https://a.example/");
+    assert.deepEqual([r.status, r.statusText, r.headers.get("x-page"), await r.text()], [203, "Fine", "1", "ok"]);
+  }
+  await assert.rejects(f1("https://a.example/"), needed);
+  assert.equal(calls, 3, "the 4th fetch never reached the network");
+  assert.equal(await (await budgetedFetch(page, admit()[1], { ...REQUEST_BUDGET, fetches: 3 })("https://a.example/")).text(), "ok",
+    "the next request has its own budget");
+
+  // Bytes: decoded body bytes summed over the request. The read that crosses the budget fails and its body is
+  // cancelled; every later read fails too.
+  let cancelled = 0;
+  const chunks = (n, size) => new ReadableStream({ pull(c) { if (n-- > 0) c.enqueue(new Uint8Array(size)); else c.close(); }, cancel() { cancelled++; } });
+  const f2 = budgetedFetch(async () => new Response(chunks(3, 300)), admit()[1], { ...REQUEST_BUDGET, bytes: 1000 });
+  assert.equal((await (await f2("https://a.example/1")).arrayBuffer()).byteLength, 900);
+  await assert.rejects((await f2("https://a.example/2")).arrayBuffer(), needed);
+  await tick();
+  assert.equal(cancelled, 1, "the body that crossed the budget was cancelled");
+  await assert.rejects((await f2("https://a.example/3")).text(), needed);
+
+  // Time: when it is up, every fetch still running is cancelled with the same BudgetError, and later ones fail at once.
+  const signals = [];
+  const hang = (_url, init) => new Promise((_resolve, reject) => {
+    signals.push(init.signal);
+    if (init.signal.aborted) reject(init.signal.reason);
+    else init.signal.addEventListener("abort", () => reject(init.signal.reason));
+  });
+  const f3 = budgetedFetch(hang, admit()[1], { ...REQUEST_BUDGET, ms: 50 });
+  const t0 = Date.now();
+  await assert.rejects(f3("https://a.example/"), needed);
+  assert.ok(Date.now() - t0 < 1000);
+  await assert.rejects(f3("https://a.example/"), needed);
+
+  // The caller's own signal and the client hanging up still cancel, each with its own reason.
+  const [r4, w4] = admit();
+  const f4 = budgetedFetch(hang, w4);
+  const own = new AbortController();
+  const p4 = f4("https://a.example/", { signal: own.signal });
+  own.abort(new Error("caller"));
+  await assert.rejects(p4, { message: "caller" });
+  const p5 = f4("https://a.example/");
+  r4.emit("close");
+  await assert.rejects(p5, { name: "AbortError" });
+
+  // Every fetch is tracked by the request's slot: closing the response doesn't free it while a fetch still runs.
+  const [r6, w6] = admit();
+  let answer;
+  const p6 = budgetedFetch(() => new Promise((resolve) => (answer = () => resolve(new Response("late")))), w6)("https://a.example/");
+  const held = gate.inFlight;
+  r6.emit("close");
+  await tick();
+  assert.equal(gate.inFlight, held, "still held while its fetch runs");
+  answer();
+  await p6;
+  await tick();
+  assert.equal(gate.inFlight, held - 1, "released once the fetch settled");
+  for (const res of open) res.emit("close");
+  assert.equal(gate.inFlight, 0);
 });
 
 let failed = 0;
