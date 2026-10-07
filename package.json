@@ -8,11 +8,13 @@
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "check": "node dist/index.js --check",
-    "test": "npm run build && node test/unit-test.mjs && node test/mock-test.mjs"
+    "test": "npm run build && node test/unit-test.mjs && node test/mock-test.mjs && node test/oauth-test.mjs"
   },
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.1",
     "html-to-text": "^10.0.1",
     "mammoth": "^1.13.0",
     "undici": "^6.29.0",
@@ -20,6 +22,7 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/html-to-text": "^9.0.4",
     "@types/node": "^26.6.4",
     "typescript": "^7.0.2"

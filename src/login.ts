@@ -53,6 +53,7 @@ const MAX_TOKEN = 512; // Canvas tokens are about 70 characters
 const TIMEOUT_MS = 15_000;
 const MAX_PROFILE = 1024 * 1024; // users/self is a few hundred bytes
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
+const PROFILE = "/api/v1/users/self";
 
 /** The body as text, or null past `max` bytes (the rest is cancelled). Throws if the connection fails mid-body. */
 async function readCapped(res: Response, max: number): Promise<string | null> {
@@ -66,11 +67,14 @@ async function readCapped(res: Response, max: number): Promise<string | null> {
   }
 }
 
-/** Where a redirect from `requestUrl` points, as a normalized Canvas origin other than `from`; else null. */
+/** Where a redirect from `requestUrl` points, as a normalized Canvas origin other than `from`; else null. Only a redirect
+ *  to the same API path counts (vanity-domain redirects keep it): the token is never re-sent to a login page, an SSO
+ *  provider, or anything else an address happens to redirect to. */
 function redirectTarget(location: string | null, requestUrl: string, from: string, allowHttp: boolean): string | null {
   if (location === null) return null;
   let to: URL;
   try { to = new URL(location, requestUrl); } catch { return null; }
+  if (to.pathname !== PROFILE) return null;
   const origin = to.origin === "null" ? null : normalizeCanvasUrl(to.origin, allowHttp); // "null": javascript:, data:, ...
   return origin === from ? null : origin;
 }
@@ -79,8 +83,9 @@ function redirectTarget(location: string | null, requestUrl: string, from: strin
  *  redirects to another plausible Canvas origin (instructure.com to a school's own domain, or the reverse) is tried
  *  there once, since the guarded fetch drops the token on a cross-origin hop. Otherwise a message for the login page;
  *  one message covers every network failure (guard refusal, DNS, connect, TLS, timeout), so the page can't map
- *  internal names. cred.url must already be an exact origin (normalizeCanvasUrl). */
-export async function verifyCanvasLogin(cred: CanvasCred, f: typeof fetch): Promise<{ url: string } | { error: string }> {
+ *  internal names. cred.url must already be an exact origin (normalizeCanvasUrl). allowHttp (tests only, from the
+ *  server's config) lets that redirect go to an http, IP or any-port address, as normalizeCanvasUrl does. */
+export async function verifyCanvasLogin(cred: CanvasCred, f: typeof fetch, opts: { allowHttp?: boolean } = {}): Promise<{ url: string } | { error: string }> {
   const { url: start, token } = cred;
   if (typeof token !== "string" || token.length > MAX_TOKEN || !/^[\x21-\x7e]+$/.test(token)) return { error: REJECTED }; // never sent
   let origin: string | undefined;
@@ -92,14 +97,14 @@ export async function verifyCanvasLogin(cred: CanvasCred, f: typeof fetch): Prom
     signal: AbortSignal.timeout(TIMEOUT_MS), // for the whole attempt, redirect included
   };
   for (let url = start, hops = 0; ; hops++) {
-    const requestUrl = `${url}/api/v1/users/self`;
+    const requestUrl = `${url}${PROFILE}`;
     let res: Response;
     try { res = await f(requestUrl, init); } catch { return { error: UNREACHABLE }; }
     if (!res.ok) {
       res.body?.cancel().catch(() => {});
       if (res.status === 401) return { error: REJECTED };
       const next = hops === 0 && REDIRECTS.has(res.status)
-        ? redirectTarget(res.headers.get("location"), requestUrl, url, start.startsWith("http:")) : null;
+        ? redirectTarget(res.headers.get("location"), requestUrl, url, opts.allowHttp === true) : null;
       if (next === null) return { error: NOT_CANVAS };
       url = next;
       continue;

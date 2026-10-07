@@ -4,6 +4,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CanvasClient } from "./canvas.js";
 import { buildServer, VERSION } from "./server.js";
 import { startSecretHttp } from "./http.js";
+import { parseRedirectOrigins } from "./oauth.js";
+import { createPublicApp, startPublicHttp } from "./public.js";
 
 const HELP = `canvas-mcp ${VERSION} — Canvas LMS MCP server (read-only)
 
@@ -20,10 +22,17 @@ Options (each also settable by env var):
   --http               Serve MCP over Streamable HTTP instead of stdio
   --port <n>           HTTP port (default 7341)                               [CANVAS_MCP_PORT]
   --host <addr>        HTTP bind address (default 127.0.0.1 = this PC only)   [CANVAS_MCP_HOST]
-  --secret <s>         Required in HTTP mode: endpoint becomes /mcp/<secret>  [MCP_SECRET]
+  --secret <s>         Single-user HTTP mode: endpoint becomes /mcp/<secret>  [MCP_SECRET]
   --check              Verify credentials and exit
   -v, --version
   -h, --help
+
+Multi-user mode (--http with PUBLIC_URL instead of a secret; each student logs in with their own Canvas):
+  PUBLIC_URL                   The server's public origin, e.g. https://canvas.example.com
+  CANVAS_MCP_KEY               At least 32 chars; encrypts every token (try: openssl rand -hex 32)
+  CANVAS_MCP_REDIRECT_HOSTS    Optional: comma-separated origins that may receive logins
+                               (default: https://claude.ai, https://claude.com, http://localhost, http://127.0.0.1)
+  TRUST_PROXY                  Optional: Express "trust proxy" (default: loopback, linklocal, uniquelocal)
 `;
 
 const { values: a } = parseArgs({
@@ -68,11 +77,34 @@ async function stdio() {
   console.error(`canvas-mcp ${VERSION} running on stdio → ${baseUrl}`);
 }
 
+/** PUBLIC_URL as a bare origin (a trailing slash is fine); anything with a path, query or credentials is refused. */
+function publicOrigin(raw: string): string {
+  let u: URL | undefined;
+  try { u = new URL(raw); } catch {}
+  if (!u || !/^https?:$/.test(u.protocol) || u.pathname !== "/" || u.search || u.hash || u.username || u.password)
+    die("PUBLIC_URL must be the server's origin with no path, e.g. https://canvas.example.com");
+  if (u.protocol === "http:" && u.hostname !== "localhost" && u.hostname !== "127.0.0.1")
+    die("PUBLIC_URL must use https (http only for localhost testing)");
+  return u.origin;
+}
+
 async function http() {
   const port = Number(a.port ?? env.CANVAS_MCP_PORT ?? 7341);
   const host = a.host ?? env.CANVAS_MCP_HOST ?? "127.0.0.1";
-  const { baseUrl, canvas } = canvasFromArgs();
   const secret = a.secret ?? env.MCP_SECRET;
+  if (env.PUBLIC_URL) {
+    if (secret) die("Set either PUBLIC_URL (multi-user) or MCP_SECRET (single-user), not both");
+    const allowPrivateNetwork = env.CANVAS_MCP_ALLOW_PRIVATE_NETWORK === "1";
+    // Throws (and so dies with) a clear message for a short CANVAS_MCP_KEY or a bad CANVAS_MCP_REDIRECT_HOSTS.
+    const app = createPublicApp({
+      publicUrl: publicOrigin(env.PUBLIC_URL), key: env.CANVAS_MCP_KEY ?? "", redirectOrigins: parseRedirectOrigins(env.CANVAS_MCP_REDIRECT_HOSTS),
+      trustProxy: env.TRUST_PROXY || "loopback, linklocal, uniquelocal", allowPrivateNetwork, maxChars: opts.maxChars,
+    });
+    if (allowPrivateNetwork) console.error("WARNING: private network access enabled — testing only");
+    startPublicHttp(app, port, host);
+    return;
+  }
+  const { baseUrl, canvas } = canvasFromArgs();
   if (!secret || secret.length < 24) die("HTTP mode needs --secret / MCP_SECRET of at least 24 chars (try: openssl rand -hex 24)");
   startSecretHttp({ secret, port, host, baseUrl, make: () => buildServer(canvas, opts) });
 }

@@ -8,6 +8,7 @@ import tls from "node:tls";
 import zlib from "node:zlib";
 import { isSameOriginPost, normalizeCanvasUrl, normalizeTimeZone, verifyCanvasLogin } from "../dist/login.js";
 import * as netguard from "../dist/netguard.js";
+import { DEFAULT_REDIRECT_ORIGINS, parseRedirectOrigins, redirectAllowed, StatelessProvider } from "../dist/oauth.js";
 import { errorPage, escapeHtml, landingPage, loginPage, pageHeaders } from "../dist/pages.js";
 import { Sealer } from "../dist/seal.js";
 
@@ -418,37 +419,65 @@ section("login", async () => {
 
   // Many schools' xxx.instructure.com redirects to a vanity domain (or the reverse). The guarded fetch drops the token on
   // a cross-origin hop, so the redirect is handled here: the token is tried once more at the new origin, and that origin
-  // is the one returned (and stored).
+  // is the one returned (and stored). Those redirects keep the path, so any other path is not followed: the token is
+  // never re-sent to a login page, an SSO provider or a status page the address happens to redirect to.
+  const SELF = "/api/v1/users/self";
   const moved = (location, status = 301) => new Response(body("Moved"), { status, headers: { location } });
   const vanity = { ...cred, url: "https://a.instructure.com" };
-  assert.deepEqual(await verify((url, n) => n === 1 ? moved("https://canvas.school-example.edu/api/v1/users/self") : Response.json({ id: 1 }), vanity),
+  assert.deepEqual(await verify((url, n) => n === 1 ? moved(`https://canvas.school-example.edu${SELF}`) : Response.json({ id: 1 }), vanity),
     { url: "https://canvas.school-example.edu" });
-  assert.deepEqual(reqs.map((r) => r.url), ["https://a.instructure.com/api/v1/users/self", "https://canvas.school-example.edu/api/v1/users/self"]);
+  assert.deepEqual(reqs.map((r) => r.url), [`https://a.instructure.com${SELF}`, `https://canvas.school-example.edu${SELF}`]);
   assert.deepEqual(reqs.map(auth), ["Bearer 1234~abcDEF", "Bearer 1234~abcDEF"], "the second request carries the token too");
   assert.deepEqual(reqs.map((r) => r.init.redirect), ["manual", "manual"]);
   assert.equal(reqs[1].init.signal, reqs[0].init.signal, "one timeout covers the whole login attempt");
   assert.equal(released, 1, "the redirect's body released unread");
-  for (const [status, location] of [[302, "https://canvas.school-example.edu/login"], [303, "//canvas.school-example.edu/x"], [307, "HTTPS://Canvas.School-Example.EDU:443/"],
-    [308, "https://canvas.school-example.edu"]])
+  for (const [status, location] of [[302, `https://canvas.school-example.edu${SELF}?as_user_id=1`], [303, `//canvas.school-example.edu${SELF}`],
+    [307, `HTTPS://Canvas.School-Example.EDU:443${SELF}`], [308, `https://canvas.school-example.edu${SELF}#x`]]) {
     assert.deepEqual(await verify((url, n) => n === 1 ? moved(location, status) : Response.json({ id: 1 }), vanity), { url: "https://canvas.school-example.edu" }, `${status} ${location}`);
-  assert.deepEqual(await verify((url, n) => n === 1 ? moved("https://canvas.school-example.edu/") : new Response(body("{}"), { status: 401 }), vanity), MSG.rejected,
+    assert.equal(reqs[1].url, `https://canvas.school-example.edu${SELF}`, `${location}: the fixed path is requested, not the Location as given`);
+  }
+  assert.deepEqual(await verify((url, n) => n === 1 ? moved(`https://canvas.school-example.edu${SELF}`) : new Response(body("{}"), { status: 401 }), vanity), MSG.rejected,
     "a token the canonical origin refuses");
   assert.equal(released, 2);
   // Only one hop, and only to another origin that is itself a plausible Canvas address.
-  assert.deepEqual(await verify((url, n) => moved(`https://b${n}.instructure.com/api/v1/users/self`), vanity), MSG.notCanvas, "two cross-origin redirects");
+  assert.deepEqual(await verify((url, n) => moved(`https://b${n}.instructure.com${SELF}`), vanity), MSG.notCanvas, "two cross-origin redirects");
   assert.deepEqual([reqs.length, released], [2, 2]);
   for (const location of ["javascript:alert(1)", "https://10.0.0.1/x", "/login", "https://a.instructure.com/login", "http://canvas.school-example.edu/",
-    "https://canvas.school-example.edu:8443/", "https://intranet/", "https://[::1]/", "https://[", "data:text/html,hi", "ftp://canvas.school-example.edu/"]) {
+    "https://canvas.school-example.edu:8443/", "https://intranet/", "https://[::1]/", "https://[", "data:text/html,hi", "ftp://canvas.school-example.edu/",
+    `https://10.0.0.1${SELF}`, `http://canvas.school-example.edu${SELF}`, `https://canvas.school-example.edu:8443${SELF}`, `https://intranet${SELF}`,
+    "https://canvas.school-example.edu/login", "//canvas.school-example.edu/x", "HTTPS://Canvas.School-Example.EDU:443/", "https://canvas.school-example.edu",
+    "https://login.microsoftonline.example/common/oauth2/authorize", `https://canvas.school-example.edu${SELF}/`, "https://canvas.school-example.edu/API/V1/users/self",
+    "https://canvas.school-example.edu/api/v1/users/self%2F", "https://canvas.school-example.edu/x/../api/v1/users/selfie"]) {
     assert.deepEqual(await verify(() => moved(location), vanity), MSG.notCanvas, location);
     assert.deepEqual([reqs.length, released], [1, 1], `${location}: no second fetch`);
   }
-  // Test mode (an http:// Canvas) follows http redirects, but still only to an http(s) origin.
+  // Test mode (an http:// Canvas, allowHttp set by the server's config) follows http redirects, but still only to an
+  // http(s) origin and the same path. Without the option an http address gets no test-mode relaxations on the redirect.
   const mock = { ...cred, url: "http://127.0.0.1:4557" };
-  assert.deepEqual(await verify((url, n) => n === 1 ? moved("http://localhost:4558/x") : Response.json({ id: 1 }), mock), { url: "http://localhost:4558" });
-  for (const location of ["javascript:alert(1)", "data:text/html,hi", "ftp://127.0.0.1/"]) {
-    assert.deepEqual(await verify(() => moved(location), mock), MSG.notCanvas, `${location} from an http Canvas`);
+  const testMode = (make) => { reqs = []; released = 0; return verifyCanvasLogin(mock, async (url, init) => { reqs.push({ url, init }); return make(url, reqs.length); }, { allowHttp: true }); };
+  assert.deepEqual(await testMode((url, n) => n === 1 ? moved(`http://localhost:4558${SELF}`) : Response.json({ id: 1 })), { url: "http://localhost:4558" });
+  for (const location of ["javascript:alert(1)", "data:text/html,hi", "ftp://127.0.0.1/", "http://localhost:4558/x"]) {
+    assert.deepEqual(await testMode(() => moved(location)), MSG.notCanvas, `${location} from an http Canvas`);
     assert.equal(reqs.length, 1, `${location} from an http Canvas: no second fetch`);
   }
+  assert.deepEqual(await verify((url, n) => n === 1 ? moved(`http://localhost:4558${SELF}`) : Response.json({ id: 1 }), mock), MSG.notCanvas,
+    "allowHttp comes from the caller, not from an http:// address");
+  assert.equal(reqs.length, 1);
+
+  // Through the real guard's redirect handling (over a stub transport): with redirect "manual" the guard hands the 3xx
+  // back with its Location intact instead of following it (and dropping the token), so the second try carries it.
+  const hops = [], answers = [];
+  const guardedStub = withUrlGuard(async (url, init) => {
+    hops.push({ url, auth: new Headers(init.headers).get("authorization"), redirect: init.redirect });
+    return hops.length === 1 ? moved(`https://canvas.school-example.edu${SELF}`) : Response.json({ id: 1 });
+  });
+  const answered = async (url, init) => { const r = await guardedStub(url, init); answers.push([r.status, r.headers.get("location")]); return r; };
+  assert.deepEqual(await verifyCanvasLogin(vanity, answered), { url: "https://canvas.school-example.edu" });
+  assert.deepEqual(answers, [[301, `https://canvas.school-example.edu${SELF}`], [200, null]], "the 3xx reached verifyCanvasLogin with its Location");
+  assert.deepEqual(hops, [
+    { url: `https://a.instructure.com${SELF}`, auth: "Bearer 1234~abcDEF", redirect: "manual" },
+    { url: `https://canvas.school-example.edu${SELF}`, auth: "Bearer 1234~abcDEF", redirect: "manual" },
+  ], "the guard made exactly the two requests, and the second carries the token");
 
   const failure = (message, code) => Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(message), { code }) });
   for (const err of [new NetGuardError("nas.lan resolves to a non-public address"), new NetGuardError("10.0.0.1 is not a public address"),
@@ -456,7 +485,7 @@ section("login", async () => {
     failure("connect ECONNREFUSED 203.0.113.7:443", "ECONNREFUSED"), failure("certificate has expired", "CERT_HAS_EXPIRED"),
     new DOMException("The operation was aborted due to timeout", "TimeoutError"), new DOMException("This operation was aborted", "AbortError"), new Error("other")]) {
     assert.deepEqual(await verify(() => { throw err; }), MSG.unreachable, err.message);
-    assert.deepEqual(await verify((url, n) => { if (n === 1) return moved("https://canvas.school-example.edu/"); throw err; }, vanity), MSG.unreachable, `after a redirect: ${err.message}`);
+    assert.deepEqual(await verify((url, n) => { if (n === 1) return moved(`https://canvas.school-example.edu${SELF}`); throw err; }, vanity), MSG.unreachable, `after a redirect: ${err.message}`);
   }
   const cut = () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"id":')); }, pull(c) { c.error(new TypeError("terminated")); } }));
   assert.deepEqual(await verify(cut), MSG.unreachable, "connection lost mid-body");
@@ -494,7 +523,7 @@ section("login", async () => {
   const mover = http.createServer((rq, rs) => { rs.writeHead(301, { location: `${local}/api/v1/users/self` }); rs.end("Moved"); });
   await new Promise((r) => mover.listen(0, "127.0.0.1", r));
   const plain = createGuardedFetch({ allowPrivate: true }), guarded = createGuardedFetch();
-  const login = (url, token, f) => verifyCanvasLogin({ url, token, tz: "UTC" }, f);
+  const login = (url, token, f) => verifyCanvasLogin({ url, token, tz: "UTC" }, f, { allowHttp: f === plain });
   const realTimeout = AbortSignal.timeout, realLookup = dns.lookup;
   try {
     assert.deepEqual(await login(local, "good~token", plain), { url: local });
@@ -610,6 +639,99 @@ section("pages", () => {
     assert.ok(html.includes('<meta name="viewport" content="width=device-width, initial-scale=1">'), `${name}: mobile viewport`);
     assert.doesNotMatch(html, /\b(src|href)=|<link|<img|<iframe|@import|url\(/i, `${name}: nothing loaded from elsewhere`);
   }
+});
+
+section("oauth", async () => {
+  // Redirect allowlist: exact origins, except that a loopback http entry takes any port (Claude Code / Desktop).
+  const d = DEFAULT_REDIRECT_ORIGINS;
+  assert.deepEqual(d, ["https://claude.ai", "https://claude.com", "http://localhost", "http://127.0.0.1"]);
+  for (const uri of ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback", "https://CLAUDE.ai:443/cb?x=1",
+    "http://localhost:6274/oauth/callback", "http://localhost/cb", "http://127.0.0.1:33418/cb"])
+    assert.equal(redirectAllowed(uri, d), true, uri);
+  for (const uri of ["https://evil.example/cb", "https://claude.ai.evil.example/cb", "https://evil.example/https://claude.ai", "http://claude.ai/cb",
+    "https://claude.ai:8443/cb", "https://localhost:6274/cb", "http://127.0.0.2:80/cb", "http://[::1]:6274/cb", "http://localhost.evil.example/cb",
+    "https://user@claude.ai/cb", "https://claude.ai/cb#frag", "javascript:alert(1)", "claude.ai/cb", "", "not a url"])
+    assert.equal(redirectAllowed(uri, d), false, uri);
+  const custom = ["https://app.example", "http://localhost:3000"];
+  assert.equal(redirectAllowed("https://app.example/cb", custom), true);
+  assert.equal(redirectAllowed("https://claude.ai/cb", custom), false, "the override replaces the default");
+  assert.equal(redirectAllowed("http://localhost:3000/cb", custom), true);
+  assert.equal(redirectAllowed("http://localhost:3001/cb", custom), false, "a loopback entry with a port is exact");
+
+  // CANVAS_MCP_REDIRECT_HOSTS: blank means the default; every entry must be an http(s) origin.
+  for (const blank of [undefined, "", "  "]) assert.equal(parseRedirectOrigins(blank), DEFAULT_REDIRECT_ORIGINS);
+  assert.deepEqual(parseRedirectOrigins(" https://app.example/ , http://localhost:3000,"), ["https://app.example", "http://localhost:3000"]);
+  for (const bad of ["claude.ai", "https://claude.ai/cb", "ftp://claude.ai", "https://Claude.ai", "https://u@claude.ai", "https://a_b.example", "https://claude.ai:443",
+    "https://claude.ai,javascript:alert(1)", ","])
+    assert.throws(() => parseRedirectOrigins(bad), /CANVAS_MCP_REDIRECT_HOSTS/, bad);
+
+  // The provider, without the SDK's handlers in front of it.
+  const sealer = new Sealer("p".repeat(32));
+  const provider = new StatelessProvider({ sealer, redirectOrigins: ["https://claude.ai", "http://localhost:3000"] });
+  const store = provider.clientsStore;
+  const client = store.registerClient({ redirect_uris: ["https://claude.ai/cb", "http://localhost:3000/cb"], client_id: "uuid-from-the-sdk", client_secret: "s3cret" });
+  assert.notEqual(client.client_id, "uuid-from-the-sdk");
+  assert.deepEqual(store.getClient(client.client_id), client, "client_id opens to the registered client");
+  assert.equal(sealer.open("client", client.client_id).client_id, undefined, "the sealed info has no client_id of its own");
+  assert.equal(sealer.open("client", client.client_id).exp, undefined, "clients never expire");
+  for (const id of ["uuid-from-the-sdk", "", sealer.seal("access", { redirect_uris: ["https://claude.ai/cb"] })]) assert.equal(store.getClient(id), undefined, id);
+  assert.throws(() => store.registerClient({ redirect_uris: ["https://claude.ai/cb", "http://localhost:3001/cb"] }), (e) => e.errorCode === "invalid_client_metadata");
+
+  const page = () => {
+    const r = { headers: {} };
+    r.status = (c) => ((r.code = c), r);
+    r.set = (h) => (Object.assign(r.headers, h), r);
+    r.type = (t) => ((r.ctype = t), r);
+    r.send = (b) => ((r.body = b), r);
+    return r;
+  };
+  const params = { redirectUri: "https://claude.ai/cb", codeChallenge: "c".repeat(43), state: "st", scopes: [] };
+  const shown = page();
+  await provider.authorize(client, params, shown);
+  assert.deepEqual([shown.code, shown.ctype], [200, "html"]);
+  assert.match(shown.headers["Content-Security-Policy"], /form-action 'self' https:\/\/claude\.ai;/);
+  const authreq = shown.body.match(/name="authreq" value="([^"]+)"/)[1];
+  assert.deepEqual(provider.openAuthReq(authreq), { redirectUri: "https://claude.ai/cb" });
+  // The SDK lets a loopback redirect URI differ from the registered one by port; the allowlist still decides.
+  const refused = page();
+  await provider.authorize(client, { ...params, redirectUri: "http://localhost:3001/cb" }, refused);
+  assert.equal(refused.code, 400);
+  assert.match(refused.body, /start again/i);
+  assert.doesNotMatch(refused.headers["Content-Security-Policy"], /localhost/);
+
+  const cred = { url: "https://yourschool.instructure.com", token: "1234~abc", tz: "America/New_York" };
+  for (const bad of ["", "garbage", sealer.seal("authreq", { redirect_uri: "https://claude.ai/cb" }, -1), sealer.seal("code", { redirect_uri: "https://claude.ai/cb" }, 60)]) {
+    assert.equal(provider.openAuthReq(bad), null);
+    assert.equal(provider.completeLogin(bad, cred), null);
+  }
+  const back = new URL(provider.completeLogin(authreq, cred));
+  assert.deepEqual([back.origin + back.pathname, back.searchParams.get("state")], ["https://claude.ai/cb", "st"]);
+  const noState = page();
+  await provider.authorize(client, { ...params, state: undefined }, noState);
+  const backNoState = new URL(provider.completeLogin(noState.body.match(/name="authreq" value="([^"]+)"/)[1], cred));
+  assert.deepEqual([...backNoState.searchParams.keys()], ["code"], "no state parameter when none was sent");
+
+  const code = back.searchParams.get("code");
+  const other = store.registerClient({ redirect_uris: ["https://claude.ai/cb"] });
+  const grantError = (e) => e.errorCode === "invalid_grant";
+  assert.equal(await provider.challengeForAuthorizationCode(client, code), "c".repeat(43));
+  await assert.rejects(provider.challengeForAuthorizationCode(other, code), grantError, "the code belongs to one client");
+  await assert.rejects(provider.exchangeAuthorizationCode(other, code), grantError);
+  await assert.rejects(provider.exchangeAuthorizationCode(client, code, undefined, "https://claude.ai/other"), grantError, "redirect_uri must match");
+  const tokens = await provider.exchangeAuthorizationCode(client, code, undefined, "https://claude.ai/cb", new URL("https://elsewhere.example/mcp"));
+  assert.deepEqual(Object.keys(tokens).sort(), ["access_token", "expires_in", "refresh_token", "token_type"]);
+  await assert.rejects(provider.exchangeAuthorizationCode(client, code), grantError, "single use");
+  await assert.rejects(provider.exchangeAuthorizationCode(client, sealer.seal("code", sealer.open("code", code), -1)), grantError, "expired code");
+
+  const info = await provider.verifyAccessToken(tokens.access_token);
+  assert.deepEqual({ ...info, expiresAt: typeof info.expiresAt }, { token: tokens.access_token, clientId: client.client_id, scopes: [], expiresAt: "number", extra: { cred } });
+  const tokenError = (e) => e.errorCode === "invalid_token";
+  for (const bad of [tokens.refresh_token, code, "", sealer.seal("access", { client_id: client.client_id, cred }, -1)])
+    await assert.rejects(provider.verifyAccessToken(bad), tokenError);
+  const again = await provider.exchangeRefreshToken(client, tokens.refresh_token);
+  assert.deepEqual((await provider.verifyAccessToken(again.access_token)).extra, { cred });
+  await assert.rejects(provider.exchangeRefreshToken(other, tokens.refresh_token), grantError);
+  await assert.rejects(provider.exchangeRefreshToken(client, tokens.access_token), grantError);
 });
 
 let failed = 0;
