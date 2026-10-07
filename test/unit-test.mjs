@@ -1,12 +1,14 @@
 // Unit tests for the multi-user building blocks (no network). Run after `npm run build`.
 import assert from "node:assert/strict";
-import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
 import dns from "node:dns";
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
 import zlib from "node:zlib";
+import { normalizeCanvasUrl, normalizeTimeZone, verifyCanvasLogin } from "../dist/login.js";
 import * as netguard from "../dist/netguard.js";
+import { errorPage, escapeHtml, landingPage, loginPage, pageHeaders } from "../dist/pages.js";
 import { Sealer } from "../dist/seal.js";
 
 const { _testing, createGuardedFetch, isPublicAddress, NetGuardError } = netguard;
@@ -298,6 +300,211 @@ section("netguard limits", async () => {
     tls.connect = realConnect;
     srv.closeAllConnections();
     srv.close();
+  }
+});
+
+section("login", async () => {
+  // normalizeCanvasUrl: the lowercase origin only; https added when there is no scheme.
+  for (const input of ["yourschool.instructure.com", "https://yourschool.instructure.com/courses/12", "HTTPS://YourSchool.instructure.com/api/v1/",
+    "  yourschool.instructure.com/  \n", "yourschool.instructure.com:443", "https://yourschool.instructure.com/?x=1#y", "https:yourschool.instructure.com"])
+    assert.equal(normalizeCanvasUrl(input), "https://yourschool.instructure.com", JSON.stringify(input));
+  assert.equal(normalizeCanvasUrl("http://x.com"), null);
+  assert.equal(normalizeCanvasUrl("http://x.com", true), "http://x.com");
+  for (const bad of ["javascript:alert(1)", "", "https://u:p@x.com", "   ", "https://u@x.com", "ftp://x.com", "file:///etc/passwd", "data:text/html,hi",
+    "mailto:a@x.com", "ws://x.com", "https://", "https://x .com", "https://a;b.com", "https://a\"b.com", "https://a'b.com",
+    "https://localhost", "localhost", "https://intranet/", "https://[::1]/", "https://x.com:8443", "x.com:8080", undefined, null, 42, ["https://x.com"]])
+    assert.equal(normalizeCanvasUrl(bad), null, JSON.stringify(bad));
+  // allowHttp is the test-only switch for the mock Canvas: http, dotless hosts and any port.
+  for (const [input, want] of [["http://127.0.0.1:4557/api", "http://127.0.0.1:4557"], ["http://localhost:4557", "http://localhost:4557"], ["https://x.com:8443/", "https://x.com:8443"]])
+    assert.equal(normalizeCanvasUrl(input, true), want, `${input} with allowHttp`);
+  for (const bad of ["ftp://x.com", "javascript:alert(1)", "https://u:p@x.com"]) assert.equal(normalizeCanvasUrl(bad, true), null, `${bad} with allowHttp`);
+  const longest = "https://x.com/" + "a".repeat(2048 - 14);
+  assert.equal(normalizeCanvasUrl(longest), "https://x.com", "2048 chars is fine");
+  assert.equal(normalizeCanvasUrl(longest + "a"), null, "over 2048 chars refused");
+
+  assert.equal(normalizeTimeZone("America/New_York"), "America/New_York");
+  assert.equal(normalizeTimeZone("america/new_york"), "America/New_York", "canonical spelling");
+  assert.equal(normalizeTimeZone("Etc/GMT+5"), "Etc/GMT+5");
+  for (const bad of [undefined, "Not/AZone", "", "UTC\n", "+05:00", "America/New_York; x", "x".repeat(200), 42, null, ["America/New_York"], {}])
+    assert.equal(normalizeTimeZone(bad), "UTC", JSON.stringify(bad));
+
+  // verifyCanvasLogin: null on success, otherwise exactly one of three messages, never upstream text or error details.
+  const MSG = {
+    rejected: "Canvas rejected that token. Check that you copied the whole token, or make a new one.",
+    unreachable: "Couldn't reach a Canvas server at that address.",
+    notCanvas: "That doesn't look like a Canvas server.",
+  };
+  const cred = { url: "https://yourschool.instructure.com", token: "1234~abcDEF", tz: "America/New_York" };
+  let req, released;
+  const body = (text) => new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(text)); c.close(); }, cancel() { released = true; } });
+  const verify = (make, c = cred) => verifyCanvasLogin(c, async (url, init) => { req = { url, init }; released = false; return make(); });
+
+  assert.equal(await verify(() => new Response(body('{"id":7,"name":"A Student"}'), { headers: { "content-type": "application/json" } })), null);
+  assert.equal(req.url, "https://yourschool.instructure.com/api/v1/users/self");
+  const sent = new Headers(req.init.headers);
+  assert.equal(sent.get("authorization"), "Bearer 1234~abcDEF");
+  assert.equal(sent.get("accept"), "application/json");
+  assert.ok(req.init.signal instanceof AbortSignal && !req.init.signal.aborted, "the request carries a timeout signal");
+  assert.equal(await verify(() => Response.json({ id: "7" })), null, "string ids count");
+  assert.equal(await verify(() => Response.json({ id: 1, pad: "x".repeat(256 * 1024) })), null, "a large profile is fine");
+
+  assert.equal(await verify(() => new Response(body('{"errors":[{"message":"Invalid access token."}]}'), { status: 401 })), MSG.rejected);
+  assert.ok(released, "401 body released unread");
+  for (const status of [302, 400, 403, 404, 429, 500, 503]) {
+    assert.equal(await verify(() => new Response(body("upstream detail"), { status })), MSG.notCanvas, `HTTP ${status}`);
+    assert.ok(released, `HTTP ${status} body released unread`);
+  }
+  for (const text of ["<!doctype html><title>Log in</title>", "", "null", "[]", '"x"', "7", "{}", '{"id":null}', '{"id":""}', '{"name":"x"}', "{bad json"])
+    assert.equal(await verify(() => new Response(body(text))), MSG.notCanvas, JSON.stringify(text));
+  // Valid JSON with an id, but far bigger than any profile: reading stops at a small cap and the rest is released.
+  let pulled = 0;
+  const huge = () => new Response(new ReadableStream({
+    start(c) { c.enqueue(new TextEncoder().encode('{"id":1,"pad":"')); },
+    pull(c) {
+      if ((pulled += 65536) <= 8 * 1048576) return c.enqueue(new Uint8Array(65536).fill(0x78));
+      c.enqueue(new TextEncoder().encode('"}'));
+      c.close();
+    },
+    cancel() { released = true; },
+  }));
+  assert.equal(await verify(huge), MSG.notCanvas, "oversized body");
+  assert.ok(released && pulled <= 2 * 1048576, `stopped reading early (${pulled} bytes) and released the rest`);
+
+  const failure = (message, code) => Object.assign(new TypeError("fetch failed"), { cause: Object.assign(new Error(message), { code }) });
+  for (const err of [new NetGuardError("nas.lan resolves to a non-public address"), new NetGuardError("10.0.0.1 is not a public address"),
+    new NetGuardError("Only https URLs are allowed, not http:"), failure("getaddrinfo ENOTFOUND intranet.example", "ENOTFOUND"),
+    failure("connect ECONNREFUSED 203.0.113.7:443", "ECONNREFUSED"), failure("certificate has expired", "CERT_HAS_EXPIRED"),
+    new DOMException("The operation was aborted due to timeout", "TimeoutError"), new DOMException("This operation was aborted", "AbortError"), new Error("other")])
+    assert.equal(await verify(() => { throw err; }), MSG.unreachable, err.message);
+  const cut = () => new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('{"id":')); }, pull(c) { c.error(new TypeError("terminated")); } }));
+  assert.equal(await verify(cut), MSG.unreachable, "connection lost mid-body");
+
+  for (const token of ["", "abc def", "abc\r\nX-Injected: 1", "tøken", "a​b", undefined, ["1234~abcDEF"]]) {
+    req = undefined;
+    assert.equal(await verify(() => Response.json({ id: 1 }), { ...cred, token }), MSG.rejected, JSON.stringify(token));
+    assert.equal(req, undefined, `${JSON.stringify(token)} can't be a Canvas token, so it is never sent`);
+  }
+
+  // Real fetch against a local stand-in for Canvas, and the real guard in front of it.
+  let hits = 0, seen;
+  const srv = http.createServer((rq, rs) => {
+    hits++;
+    seen = { url: rq.url, auth: rq.headers.authorization, accept: rq.headers.accept };
+    if (rq.headers.authorization === "Bearer hang") return; // never answers
+    if (rq.headers.authorization !== "Bearer good~token") { rs.writeHead(401, { "content-type": "application/json" }); return rs.end('{"errors":[{"message":"Invalid access token."}]}'); }
+    rs.writeHead(200, { "content-type": "application/json" });
+    rs.end('{"id":1,"name":"A Student"}');
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  const port = srv.address().port, local = `http://127.0.0.1:${port}`;
+  const plain = createGuardedFetch({ allowPrivate: true }), guarded = createGuardedFetch();
+  const login = (url, token, f) => verifyCanvasLogin({ url, token, tz: "UTC" }, f);
+  const realTimeout = AbortSignal.timeout, realLookup = dns.lookup;
+  try {
+    assert.equal(await login(local, "good~token", plain), null);
+    assert.deepEqual(seen, { url: "/api/v1/users/self", auth: "Bearer good~token", accept: "application/json" });
+    assert.equal(await login(local, "wrong", plain), MSG.rejected);
+
+    // 15 s per login attempt (shortened here, through AbortSignal.timeout, so the test doesn't wait).
+    const asked = [];
+    AbortSignal.timeout = (ms) => { asked.push(ms); return realTimeout.call(AbortSignal, 50); };
+    const t0 = Date.now();
+    assert.equal(await login(local, "hang", plain), MSG.unreachable, "timeout");
+    assert.ok(Date.now() - t0 < 2000, "gave up at the deadline");
+    assert.deepEqual(asked, [15_000]);
+    AbortSignal.timeout = realTimeout;
+
+    // Everything the guard refuses reads the same as an address with nothing there, so the login page can't be
+    // used to find out which internal names exist.
+    const before = hits;
+    for (const url of [`https://127.0.0.1:${port}`, `https://localhost:${port}`, local])
+      assert.equal(await login(url, "good~token", guarded), MSG.unreachable, url);
+    assert.equal(hits, before, "the guard stopped all of them before they reached the server");
+    dns.lookup = (host, opts, cb) => host === "nas.example"
+      ? cb(null, [{ address: "192.168.1.10", family: 4 }])
+      : cb(Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: "ENOTFOUND" }));
+    for (const url of ["https://nas.example", "https://missing.example"]) assert.equal(await login(url, "good~token", guarded), MSG.unreachable, url);
+  } finally {
+    AbortSignal.timeout = realTimeout;
+    dns.lookup = realLookup;
+    srv.closeAllConnections();
+    srv.close();
+  }
+  assert.equal(await login(local, "good~token", plain), MSG.unreachable, "connection refused once the server is gone");
+});
+
+section("pages", () => {
+  assert.equal(escapeHtml('<a href="x">&\''), "&lt;a href=&quot;x&quot;&gt;&amp;&#39;");
+  assert.equal(escapeHtml("plain text"), "plain text");
+  assert.equal(escapeHtml("&amp;"), "&amp;amp;", "already-escaped text is escaped again");
+
+  const authreq = "AbC-123_xyz";
+  const login = loginPage({ authreq, redirectHost: "claude.ai" });
+  const attr = (tag, name) => tag.match(new RegExp(` ${name}="([^"]*)"`))?.[1];
+  const fields = (html) => Object.fromEntries([...html.matchAll(/<input [^>]*>/g)].map(([tag]) => [attr(tag, "name"), tag]));
+  const scripts = (html) => [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+
+  // The form posts to /login with exactly the fields the handler reads.
+  assert.equal(login.match(/<form [^>]*>/g)?.join(), '<form method="post" action="/login">');
+  const f = fields(login);
+  assert.deepEqual(Object.keys(f).sort(), ["authreq", "canvas_url", "tz", "token"].sort());
+  assert.deepEqual([attr(f.authreq, "type"), attr(f.authreq, "value")], ["hidden", authreq]);
+  assert.deepEqual([attr(f.tz, "type"), attr(f.tz, "id")], ["hidden", "tz"]);
+  assert.equal(attr(f.canvas_url, "placeholder"), "https://yourschool.instructure.com");
+  assert.equal(attr(f.canvas_url, "value"), "", "empty until a URL was entered");
+  assert.deepEqual([attr(f.token, "type"), attr(f.token, "autocomplete"), attr(f.token, "spellcheck")], ["password", "off", "false"]);
+  assert.equal(attr(fields(loginPage({ authreq, redirectHost: "claude.ai", canvasUrl: "yourschool.instructure.com" })).canvas_url, "value"), "yourschool.instructure.com",
+    "the entered URL is kept after an error");
+  assert.doesNotMatch(login, /role="alert"/, "no error box without an error");
+
+  // One inline script fills the time zone; the CSP allows exactly that script by hash and nothing else.
+  const [tzScript, ...more] = scripts(login);
+  assert.deepEqual(more, []);
+  assert.match(tzScript, /getElementById\("tz"\)\.value\s*=\s*Intl\.DateTimeFormat\(\)\.resolvedOptions\(\)\.timeZone/);
+  const csp = `default-src 'none'; style-src 'unsafe-inline'; script-src 'sha256-${createHash("sha256").update(tzScript).digest("base64")}'; ` +
+    "img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'";
+  const common = { "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Cache-Control": "no-store" };
+  assert.deepEqual(pageHeaders(), { "Content-Security-Policy": csp, ...common });
+  // The login form's POST ends in a redirect back to the client, and browsers hold that redirect to form-action too.
+  for (const origin of ["https://claude.ai", "http://127.0.0.1:33418", "http://localhost:6274", "https://x.example:8443"])
+    assert.deepEqual(pageHeaders(origin), { "Content-Security-Policy": csp.replace("form-action 'self'", `form-action 'self' ${origin}`), ...common }, origin);
+  for (const bad of ["", "claude.ai", "https://claude.ai/", "https://claude.ai/cb", "https://Claude.ai", "https://u@claude.ai", "https://claude.ai:443",
+    "https://claude.ai; script-src *", "https://claude.ai 'unsafe-inline'", "https://claude.ai\r\nSet-Cookie: x=1", "https://a'b.com", 'https://a"b.com', "https://a;b.com",
+    "https://*.claude.ai", "javascript:alert(1)", "data:", "ftp://claude.ai", "*", "'self'", null, 42])
+    assert.throws(() => pageHeaders(bad), Error, JSON.stringify(bad));
+
+  // Copy: how to make a token, what it can do, who is trusted with it, how to revoke it, and where the login goes next.
+  for (const text of ["Canvas for Claude", "Account → Settings", "Approved Integrations", "+ New Access Token", "only reads", "full-power",
+    "runs this server", "trust", "delete the token", "After you log in you'll go back to <strong>claude.ai</strong>."])
+    assert.ok(login.includes(text), `login page: ${text}`);
+
+  // Every interpolated value is escaped.
+  const evil = `"><script>alert(1)</script><b>'`, escaped = "&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;&lt;b&gt;&#39;";
+  const hostile = loginPage({ authreq: evil, redirectHost: evil, error: evil, canvasUrl: evil });
+  assert.equal(hostile.split(escaped).length - 1, 4, "authreq, redirect host, error and entered URL");
+  assert.ok(!hostile.includes("<b>") && scripts(hostile).length === 1 && Object.keys(fields(hostile)).length === 4);
+  const withError = loginPage({ authreq, redirectHost: "claude.ai", error: "<b>" });
+  assert.ok(withError.includes("&lt;b&gt;") && !withError.includes("<b>"));
+  assert.match(withError, /role="alert"/);
+
+  const landing = landingPage("https://canvas.example.com");
+  assert.ok(landing.includes("<code>https://canvas.example.com/mcp</code>"), "connector URL");
+  assert.ok(landingPage("https://canvas.example.com/").includes("<code>https://canvas.example.com/mcp</code>"), "trailing slash");
+  for (const text of ["Settings → Connectors", "Add custom connector", "only reads", "full-power", "trust", "Approved Integrations"])
+    assert.ok(landing.includes(text), `landing page: ${text}`);
+  const hostileLanding = landingPage(evil);
+  assert.ok(hostileLanding.includes(escaped) && !hostileLanding.includes("<b>") && scripts(hostileLanding).length === 0);
+
+  const error = errorPage("This login link expired.");
+  assert.ok(error.includes("This login link expired.") && error.includes("Start again from Claude"));
+  const hostileError = errorPage(evil);
+  assert.ok(hostileError.includes(escaped) && !hostileError.includes("<b>") && scripts(hostileError).length === 0);
+
+  for (const [name, html] of [["login", login], ["landing", landing], ["error", error]]) {
+    assert.match(html, /^<!doctype html>\n<html lang="en">/, name);
+    assert.ok(html.includes('<meta charset="utf-8">'), `${name}: charset`);
+    assert.ok(html.includes('<meta name="viewport" content="width=device-width, initial-scale=1">'), `${name}: mobile viewport`);
+    assert.doesNotMatch(html, /\b(src|href)=|<link|<img|<iframe|@import|url\(/i, `${name}: nothing loaded from elsewhere`);
   }
 });
 
