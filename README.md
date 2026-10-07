@@ -133,7 +133,7 @@ Without Coolify, any Docker host works the same way. Without Docker: `PUBLIC_URL
 
 claude.ai's servers and your students' browsers both have to reach `PUBLIC_URL` over HTTPS.
 
-- **Cloudflare Tunnel**: no port forwarding needed, but your domain's DNS has to be on Cloudflare. Point a public hostname at the container's port 7341, or at Coolify's proxy.
+- **Cloudflare Tunnel**: no port forwarding needed, but your domain's DNS has to be on Cloudflare. Point a public hostname straight at the container's port 7341, not at Coolify's proxy. By default, Coolify's proxy replaces every student's IP address with the tunnel's, so all students would share one login limit.
 - **Coolify's built-in proxy**: point the domain's DNS at your server, forward ports 80 and 443 to it, and set the resource's domain to `PUBLIC_URL`. Coolify gets a Let's Encrypt certificate.
 
 **Don't put it behind Cloudflare Access or Basic Auth.** claude.ai can't log in through those; the Canvas login is the protection.
