@@ -33,7 +33,7 @@ Multi-user mode (--http with PUBLIC_URL instead of a secret; each student logs i
   CANVAS_MCP_KEY               Random, at least 32 chars: openssl rand -hex 32. Encrypts every login;
                                changing it logs everyone out
   CANVAS_MCP_REDIRECT_HOSTS    Optional: comma-separated origins that may receive logins
-                               (default: https://claude.ai, https://claude.com, http://localhost, http://127.0.0.1)
+                               (default: https://claude.ai, https://claude.com, https://chatgpt.com, http://localhost, http://127.0.0.1)
   TRUST_PROXY                  Optional: addresses/subnets of reverse proxies to believe about client IPs
                                (default: loopback, linklocal, uniquelocal; "true" and hop counts don't work)
   CANVAS_MCP_ALLOW_PRIVATE_NETWORK=1

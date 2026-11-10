@@ -14,8 +14,8 @@ import type { Sealer } from "./seal.js";
 /** Token lifetimes in seconds. Clients never expire. */
 export const AUTHREQ_TTL = 600, CODE_TTL = 60, ACCESS_TTL = 3600, REFRESH_TTL = 90 * 24 * 3600;
 
-/** Who may receive a login: claude.ai, and loopback on any port for Claude Code / Desktop. */
-export const DEFAULT_REDIRECT_ORIGINS = ["https://claude.ai", "https://claude.com", "http://localhost", "http://127.0.0.1"];
+/** Who may receive a login: claude.ai, ChatGPT, and loopback on any port for Claude Code / Desktop. */
+export const DEFAULT_REDIRECT_ORIGINS = ["https://claude.ai", "https://claude.com", "https://chatgpt.com", "http://localhost", "http://127.0.0.1"];
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1"]);
 

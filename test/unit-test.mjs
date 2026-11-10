@@ -658,8 +658,8 @@ section("pages", () => {
 section("oauth", async () => {
   // Redirect allowlist: exact origins, except that a loopback http entry takes any port (Claude Code / Desktop).
   const d = DEFAULT_REDIRECT_ORIGINS;
-  assert.deepEqual(d, ["https://claude.ai", "https://claude.com", "http://localhost", "http://127.0.0.1"]);
-  for (const uri of ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback", "https://CLAUDE.ai:443/cb?x=1",
+  assert.deepEqual(d, ["https://claude.ai", "https://claude.com", "https://chatgpt.com", "http://localhost", "http://127.0.0.1"]);
+  for (const uri of ["https://claude.ai/api/mcp/auth_callback", "https://claude.com/api/mcp/auth_callback", "https://chatgpt.com/connector_platform_oauth_redirect","https://CLAUDE.ai:443/cb?x=1",
     "http://localhost:6274/oauth/callback", "http://localhost/cb", "http://127.0.0.1:33418/cb"])
     assert.equal(redirectAllowed(uri, d), true, uri);
   for (const uri of ["https://evil.example/cb", "https://claude.ai.evil.example/cb", "https://evil.example/https://claude.ai", "http://claude.ai/cb",

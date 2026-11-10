@@ -145,7 +145,7 @@ claude.ai's servers and your students' browsers both have to reach `PUBLIC_URL` 
 |---|---|---|
 | `PUBLIC_URL` | (required) | The server's public origin, no path, e.g. `https://canvas.example.com`. Must be https (http only for `localhost` testing). |
 | `CANVAS_MCP_KEY` | (required) | Encrypts every login. At least 32 characters, random: `openssl rand -hex 32`. Changing it logs everyone out. |
-| `CANVAS_MCP_REDIRECT_HOSTS` | claude.ai, claude.com, localhost | Comma-separated origins allowed to receive logins (the OAuth redirect targets of Claude apps). Leave it unset normally. |
+| `CANVAS_MCP_REDIRECT_HOSTS` | claude.ai, claude.com, chatgpt.com, localhost | Comma-separated origins allowed to receive logins (the OAuth redirect targets of Claude apps and ChatGPT). Leave it unset normally. |
 | `TRUST_PROXY` | `loopback, linklocal, uniquelocal` | Addresses or subnets of the reverse proxies whose `X-Forwarded-For` is believed (Express "trust proxy"). The default covers a proxy on the same machine or a private network, such as Coolify's proxy or cloudflared. Use addresses, not `true` or a hop count: anything trusted can fake a client's IP and dodge the login limit. |
 | `CANVAS_MCP_ALLOW_PRIVATE_NETWORK` | off | `1` turns the network guard off, so logins can reach http and private addresses. For local testing only, never in production. |
 | `CANVAS_MCP_PORT` / `CANVAS_MCP_HOST` | 7341 / 127.0.0.1 | Listen port and address. The Docker image uses 0.0.0.0. |
@@ -163,7 +163,10 @@ claude.ai's servers and your students' browsers both have to reach `PUBLIC_URL` 
 
 ### Option E: ChatGPT
 
-ChatGPT only connects to servers on the internet, so first host it as in Option C. Then in ChatGPT go to Settings → Apps & Connectors → Create (turn on Developer mode under Advanced if you don't see Create), paste the same `https://canvas-mcp.yourdomain.com/mcp/<MCP_SECRET>` URL, and pick **No authentication**.
+ChatGPT only connects to servers on the internet, so first host it as in Option C or Option D. Then in ChatGPT go to Settings → Apps & Connectors → Create (turn on Developer mode under Advanced if you don't see Create) and paste the connector URL:
+
+- **Option C (one account):** `https://canvas-mcp.yourdomain.com/mcp/<MCP_SECRET>`, with authentication set to **No authentication**.
+- **Option D (multi-user):** `https://canvas.example.com/mcp`, with authentication set to **OAuth**. ChatGPT opens the Canvas login page; log in there like on claude.ai. Never put `CANVAS_MCP_KEY` in the URL: it's the server's encryption key, not a password.
 
 Without Developer mode, ChatGPT only uses the `search` and `fetch` tools (search pages, files and assignments across all your courses, then read one). With Developer mode on, it can use every tool.
 
