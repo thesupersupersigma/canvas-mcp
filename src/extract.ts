@@ -1,6 +1,5 @@
 // Turns Canvas HTML and uploaded files into plain text Claude can read.
 import { convert } from "html-to-text";
-import { extractText, getDocumentProxy } from "unpdf";
 import mammoth from "mammoth";
 
 export function htmlToText(html: string | null | undefined, maxChars = 20000): string {
@@ -28,21 +27,28 @@ export async function extractFileText(
   bytes: Uint8Array,
   filename: string,
   contentType: string,
-): Promise<{ text: string; kind: string }> {
+): Promise<{ text: string; kind: string; pageTexts?: string[] }> {
   const name = filename.toLowerCase();
   const ct = contentType.toLowerCase();
 
   if (name.endsWith(".pdf") || ct.includes("pdf")) {
-    const pdf = await getDocumentProxy(bytes);
-    const { text, totalPages } = await extractText(pdf, { mergePages: false });
-    const pages = (text as string[]).map((t, i) => `--- Page ${i + 1} ---\n${t.trim()}`).join("\n\n");
-    const isScanned = pages.replace(/--- Page \d+ ---/g, "").trim().length < 20 * totalPages;
-    return {
-      text: isScanned
-        ? pages + "\n\n[Note: this PDF has almost no text layer — it's probably scanned images. Download it and attach it to the chat directly so Claude can see the pages.]"
-        : pages,
-      kind: `pdf (${totalPages} pages)`,
-    };
+    const doc = await openPdf(bytes);
+    try {
+      const pageTexts: string[] = [];
+      for (let n = 1; n <= doc.numPages; n++) {
+        const page = await doc.getPage(n);
+        const tc = await page.getTextContent();
+        pageTexts.push(tc.items.map((it: any) => (it.str ?? "") + (it.hasEOL ? "\n" : "")).join("").replace(/[ \t]+\n/g, "\n").trim());
+        page.cleanup();
+      }
+      return {
+        text: pageTexts.map((t, i) => `--- Page ${i + 1} ---\n${t || "[no text on this page — scanned/handwritten]"}`).join("\n\n"),
+        kind: `pdf (${doc.numPages} pages)`,
+        pageTexts,
+      };
+    } finally {
+      await closePdf(doc);
+    }
   }
 
   if (name.endsWith(".docx") || ct.includes("wordprocessingml")) {
@@ -122,4 +128,99 @@ async function readZip(bytes: Uint8Array, want: (name: string) => boolean): Prom
     ptr += 46 + nameLen + extraLen + commentLen;
   }
   return out;
+}
+
+/** Pages a PDF page needs fewer than this many characters of text to count as an image-only (scanned) page. */
+export const SCANNED_PAGE_CHARS = 20;
+
+/**
+ * Open a PDF with the full pdfjs-dist build. Its JBIG2/JPX wasm decoders matter for school copier scans, which are
+ * usually a faint JPEG background plus a JBIG2 layer holding the actual text; without the decoder that layer is
+ * silently dropped and pages render nearly blank.
+ */
+async function openPdf(bytes: Uint8Array): Promise<any> {
+  const { createRequire } = await import("node:module");
+  const path = await import("node:path");
+  const { pathToFileURL } = await import("node:url");
+  const req = createRequire(import.meta.url);
+  const root = path.dirname(req.resolve("pdfjs-dist/package.json"));
+  // pdf.js insists on a trailing "/" (a Windows "\\" is rejected), and Node reads "C:/x/y/" fine on Windows.
+  const dir = (d: string) => path.join(root, d).split(path.sep).join("/") + "/";
+  const pdfjs: any = await import(pathToFileURL(path.join(root, "legacy", "build", "pdf.mjs")).href);
+  return pdfjs.getDocument({
+    data: bytes.slice(), // pdf.js may detach the buffer it is given
+    wasmUrl: dir("wasm"),
+    standardFontDataUrl: dir("standard_fonts"),
+    cMapUrl: dir("cmaps"),
+    iccUrl: dir("iccs"),
+    isEvalSupported: false,
+    verbosity: 0,
+  }).promise;
+}
+
+async function closePdf(doc: any): Promise<void> {
+  // pdf.js 6 moved destroy() from the document to its loading task.
+  await (typeof doc.destroy === "function" ? doc.destroy() : doc.loadingTask?.destroy?.());
+}
+
+/**
+ * Render PDF pages to JPEGs. Returns null if the native canvas module isn't installed.
+ */
+export async function renderPdfPages(
+  bytes: Uint8Array,
+  pageNumbers: number[],
+): Promise<{ page: number; data: string }[] | null> {
+  let cv: typeof import("@napi-rs/canvas");
+  try {
+    cv = await import("@napi-rs/canvas");
+  } catch {
+    return null;
+  }
+  const doc = await openPdf(bytes);
+  try {
+    const out: { page: number; data: string }[] = [];
+    for (const n of pageNumbers) {
+      const page = await doc.getPage(n);
+      // ~144 DPI for a letter page; images get downscaled past ~1600px anyway, so more is wasted bytes.
+      const base = page.getViewport({ scale: 1 });
+      const scale = Math.min(2, 1600 / Math.max(base.width, base.height));
+      const vp = page.getViewport({ scale });
+      const c = cv.createCanvas(Math.ceil(vp.width), Math.ceil(vp.height));
+      const ctx = c.getContext("2d");
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, c.width, c.height);
+      await page.render({ canvas: c, canvasContext: ctx, viewport: vp }).promise;
+      out.push({ page: n, data: (await c.encode("jpeg", 80)).toString("base64") });
+      page.cleanup();
+    }
+    return out;
+  } finally {
+    await closePdf(doc);
+  }
+}
+
+/** Parse "3", "2-6", "1,4,7-9" into sorted unique page numbers within 1..max. */
+export function parsePages(spec: string, max: number): number[] {
+  const set = new Set<number>();
+  for (const part of spec.split(",").map((x) => x.trim()).filter(Boolean)) {
+    const m = part.match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+    if (!m) throw new Error(`Bad pages value "${part}". Use e.g. "3", "2-6" or "1,4,7".`);
+    const a = Number(m[1]), b = Number(m[2] ?? m[1]);
+    for (let i = Math.min(a, b); i <= Math.max(a, b); i++) if (i >= 1 && i <= max) set.add(i);
+  }
+  return [...set].sort((x, y) => x - y);
+}
+
+/** Canvas file links inside HTML (assignment instructions, pages, announcements…). */
+export function linkedFiles(html: string | null | undefined): { id: string; name: string }[] {
+  if (!html) return [];
+  const found = new Map<string, string>();
+  for (const m of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    const id = m[1].match(/\/files\/(\d+)/)?.[1];
+    if (!id) continue;
+    const name = htmlToText(m[2]).trim() || m[1].match(/title="([^"]*)"/)?.[1] || "";
+    if (!found.get(id)) found.set(id, name);
+  }
+  for (const m of html.matchAll(/\/files\/(\d+)/g)) if (!found.has(m[1])) found.set(m[1], "");
+  return [...found].map(([id, name]) => ({ id, name: name || `(unnamed file ${id})` }));
 }

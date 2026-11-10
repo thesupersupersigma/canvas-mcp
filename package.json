@@ -13,9 +13,10 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.31.0",
+    "@napi-rs/canvas": "^1.0.10",
     "html-to-text": "^10.0.1",
     "mammoth": "^1.13.0",
-    "unpdf": "^1.8.1",
+    "pdfjs-dist": "^6.3.289",
     "zod": "^4.6.5"
   },
   "devDependencies": {

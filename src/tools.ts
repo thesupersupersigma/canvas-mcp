@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { CanvasClient } from "./canvas.js";
-import { extractFileText, htmlToText, truncate } from "./extract.js";
+import { CanvasClient, CanvasError } from "./canvas.js";
+import { SCANNED_PAGE_CHARS, extractFileText, htmlToText, linkedFiles, parsePages, renderPdfPages, truncate } from "./extract.js";
 
 export interface ToolOptions {
   timeZone: string;
@@ -16,14 +16,14 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
     return new Date(iso).toLocaleString("en-US", {
       timeZone: opts.timeZone, weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
     });
-  };  const fmtDay = (iso: string) =>
+  };
+  const fmtDay = (iso: string) =>
     new Date(iso).toLocaleDateString("en-US", { timeZone: opts.timeZone, weekday: "short", month: "short", day: "numeric" }) + " (all day)";
   const isLocalMidnight = (iso: string) =>
     new Date(iso).toLocaleTimeString("en-US", { timeZone: opts.timeZone, hour12: false, hour: "2-digit", minute: "2-digit" }).replace(/^24/, "00") === "00:00";
   // Calendar "events" with no real time (lesson topics, test days) come through as midnight; show them as all-day.
   const fmtWhen = (iso: string | null | undefined, allDay?: boolean, isEvent?: boolean) =>
     !iso ? null : allDay || (isEvent && isLocalMidnight(iso)) ? fmtDay(iso) : fmt(iso);
-
   const ok = (data: unknown) => ({
     content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 1) }],
   });
@@ -32,6 +32,48 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
     try { return ok(await fn(a)); } catch (e) { return fail(e); }
   };
   const ro = { readOnlyHint: true, openWorldHint: true } as const;
+
+  // When a teacher hides the Files tab, /courses/:id/files returns 403. Files are still reachable by id,
+  // so collect every file referenced from modules, assignments, pages, the syllabus and announcements.
+  type Found = { id: string; name: string; found_in: string };
+  const discoverCache = new Map<string, { at: number; files: Found[] }>();
+  async function discoverFiles(course_id: string): Promise<Found[]> {
+    const hit = discoverCache.get(course_id);
+    if (hit && Date.now() - hit.at < 10 * 60e3) return hit.files;
+    const found = new Map<string, Found>();
+    const add = (id: string | number | undefined, name: string, where: string) => {
+      if (id === undefined || id === null) return;
+      const k = String(id);
+      const cur = found.get(k);
+      if (!cur) found.set(k, { id: k, name, found_in: where });
+      else if (cur.name.startsWith("(unnamed") && !name.startsWith("(unnamed")) cur.name = name;
+    };
+    const [mods, assigns, course, pages, anns] = await Promise.all([
+      canvas.getAll(`/courses/${course_id}/modules`, { include: ["items"] }).catch(() => []),
+      canvas.getAll(`/courses/${course_id}/assignments`).catch(() => []),
+      canvas.get(`/courses/${course_id}`, { include: ["syllabus_body"] }).catch(() => null),
+      canvas.getAll(`/courses/${course_id}/pages`, { sort: "updated_at", order: "desc" }, 1).catch(() => []),
+      canvas.getAll("/announcements", {
+        context_codes: [`course_${course_id}`], start_date: new Date(Date.now() - 365 * 864e5).toISOString(),
+      }).catch(() => []),
+    ]);
+    for (const m of mods) for (const i of m.items ?? []) if (i.type === "File") add(i.content_id, i.title, `module "${m.name}"`);
+    for (const a of assigns) for (const f of linkedFiles(a.description)) add(f.id, f.name, `assignment "${a.name}"`);
+    for (const f of linkedFiles(course?.syllabus_body)) add(f.id, f.name, "syllabus");
+    for (const a of anns) for (const f of linkedFiles(a.message)) add(f.id, f.name, `announcement "${a.title}"`);
+    // Page bodies aren't in the list response; fetch the most recently edited ones, a few at a time.
+    const recent = pages.slice(0, 40);
+    for (let i = 0; i < recent.length; i += 6) {
+      const bodies = await Promise.all(
+        recent.slice(i, i + 6).map((p: any) => canvas.get(`/courses/${course_id}/pages/${encodeURIComponent(p.url)}`).catch(() => null)),
+      );
+      for (const b of bodies) if (b) for (const f of linkedFiles(b.body)) add(f.id, f.name, `page "${b.title}"`);
+    }
+    const files = [...found.values()];
+    discoverCache.set(course_id, { at: Date.now(), files });
+    return files;
+  }
+  const filesTabHidden = (e: unknown) => e instanceof CanvasError && (e.status === 403 || e.status === 404 || e.status === 401);
 
   // ---------- Courses ----------
   server.registerTool("list_courses", {
@@ -66,6 +108,7 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
       course: c.name,
       teachers: c.teachers?.map((t: any) => t.display_name),
       syllabus: htmlToText(c.syllabus_body, opts.maxChars) || "(No syllabus text on Canvas. Check list_files or list_modules for a syllabus PDF.)",
+      linked_files: linkedFiles(c.syllabus_body),
     };
   }));
 
@@ -122,10 +165,14 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
 
   server.registerTool("get_assignment", {
     title: "Get assignment details",
-    description: "Full instructions for one assignment, plus the rubric, your submission, your grade, and teacher feedback comments.",
+    description:
+      "Full instructions for one assignment, plus the rubric, your submission, your grade, teacher feedback comments, and " +
+      "linked_files (ids of Canvas files linked in the instructions, such as study guides and answer keys, which you can open with read_file).",
     inputSchema: { course_id: courseId, assignment_id: z.union([z.string(), z.number()]).transform(String) },
     annotations: ro,
-  }, safe(async ({ course_id, assignment_id }) => {
+  }, safe(({ course_id, assignment_id }) => getAssignment(course_id, assignment_id)));
+
+  async function getAssignment(course_id: string, assignment_id: string) {
     const [a, sub] = await Promise.all([
       canvas.get(`/courses/${course_id}/assignments/${assignment_id}`),
       canvas.get(`/courses/${course_id}/assignments/${assignment_id}/submissions/self`, {
@@ -136,6 +183,7 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
       name: a.name, due: fmt(a.due_at), lock_at: fmt(a.lock_at), points: a.points_possible,
       submission_types: a.submission_types, allowed_extensions: a.allowed_extensions,
       instructions: htmlToText(a.description, opts.maxChars) || "(no description)",
+      linked_files: linkedFiles(a.description),
       rubric: a.rubric?.map((r: any) => ({
         criterion: r.description, details: r.long_description || undefined, points: r.points,
         ratings: r.ratings?.map((x: any) => `${x.points}: ${x.description}`),
@@ -148,7 +196,7 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
       },
       url: a.html_url,
     };
-  }));
+  }
 
   // ---------- Grades ----------
   server.registerTool("get_grades", {
@@ -214,15 +262,21 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
     description: "Read the full text of a Canvas page.",
     inputSchema: { course_id: courseId, page_url: z.string().describe("page_url slug from list_pages/list_modules, or a page id") },
     annotations: ro,
-  }, safe(async ({ course_id, page_url }) => {
+  }, safe(async ({ course_id, page_url }) => (await readPage(course_id, page_url)).text));
+
+  async function readPage(course_id: string, page_url: string) {
     const p = await canvas.get(`/courses/${course_id}/pages/${encodeURIComponent(page_url)}`);
-    return `# ${p.title}\n\n${htmlToText(p.body, opts.maxChars)}`;
-  }));
+    const files = linkedFiles(p.body);
+    const list = files.length ? `\n\n## Linked files (open with read_file)\n${files.map((f) => `- ${f.name} — file_id ${f.id}`).join("\n")}` : "";
+    return { title: p.title as string, text: `# ${p.title}\n\n${htmlToText(p.body, opts.maxChars)}${list}` };
+  }
 
   // ---------- Files ----------
   server.registerTool("list_files", {
     title: "List files",
-    description: "List or search files uploaded to a course (slides, PDFs, worksheets, study guides).",
+    description:
+      "List or search files uploaded to a course (slides, PDFs, worksheets, study guides, answer keys). Still works when the " +
+      "teacher hides the Files tab: it then finds files linked from modules, assignments, pages and announcements.",
     inputSchema: {
       course_id: courseId,
       search: z.string().optional().describe("Search by filename (at least 2 characters)"),
@@ -230,42 +284,128 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
     },
     annotations: ro,
   }, safe(async ({ course_id, search, sort }) => {
-    const files = await canvas.getAll(`/courses/${course_id}/files`, {
-      search_term: search && search.length >= 2 ? search : undefined, sort, order: sort === "updated_at" ? "desc" : "asc",
-    }, 3);
-    return files.map((f: any) => ({
-      id: f.id, name: f.display_name, type: f.mime_class, size_kb: Math.round(f.size / 1024), updated: fmt(f.updated_at),
-    }));
+    try {
+      const files = await canvas.getAll(`/courses/${course_id}/files`, {
+        search_term: search && search.length >= 2 ? search : undefined, sort, order: sort === "updated_at" ? "desc" : "asc",
+      }, 3);
+      return files.map((f: any) => ({
+        id: f.id, name: f.display_name, type: f.mime_class, size_kb: Math.round(f.size / 1024), updated: fmt(f.updated_at),
+      }));
+    } catch (e) {
+      if (!filesTabHidden(e)) throw e;
+      const q = search?.toLowerCase();
+      const files = (await discoverFiles(course_id)).filter((f) => !q || f.name.toLowerCase().includes(q));
+      return {
+        note: "This course's Files tab is hidden from students, so these are the files linked from modules, assignments, pages, " +
+          "the syllabus and announcements instead. Any of them can be opened with read_file.",
+        files,
+      };
+    }
   }));
 
-  const fileCache = new Map<string, { name: string; kind: string; text: string }>();
+  type CachedFile = { name: string; kind: string; text: string; pdf?: Uint8Array; pageTexts?: string[]; image?: { data: string; mime: string } };
+  const fileCache = new Map<string, CachedFile>();
+  const MAX_IMAGES = 5;
+
+  async function loadFile(file_id: string, course_id?: string): Promise<CachedFile> {
+    const cached = fileCache.get(file_id);
+    if (cached) return cached;
+    let meta: any;
+    try {
+      meta = await canvas.get(`/files/${file_id}`);
+    } catch (e) {
+      if (!course_id) throw e;
+      meta = await canvas.get(`/courses/${course_id}/files/${file_id}`);
+    }
+    if (!meta.url) throw new Error(`File "${meta.display_name}" is locked or has no download link${meta.lock_explanation ? `: ${htmlToText(meta.lock_explanation)}` : ""}`);
+    if (meta.size > 50 * 1024 * 1024) throw new Error(`File is ${Math.round(meta.size / 1048576)} MB; too large to read here.`);
+    const { bytes, contentType } = await canvas.download(meta.url);
+    const mime = String(meta["content-type"] || contentType).toLowerCase();
+    let doc: CachedFile;
+    if (/^image\/(png|jpe?g|gif|webp)/.test(mime)) {
+      if (bytes.length > 4.5 * 1024 * 1024) throw new Error("Image is too large to send (over 4.5 MB). Download it and attach it to the chat.");
+      doc = { name: meta.display_name, kind: "image", text: "", image: { data: Buffer.from(bytes).toString("base64"), mime: mime.replace("jpg", "jpeg").split(";")[0] } };
+    } else {
+      const { text, kind, pageTexts } = await extractFileText(bytes, meta.display_name, mime);
+      doc = { name: meta.display_name, kind, text, pageTexts, pdf: pageTexts ? bytes : undefined };
+    }
+    fileCache.set(file_id, doc);
+    if (fileCache.size > 20) fileCache.delete(fileCache.keys().next().value!);
+    return doc;
+  }
+
   server.registerTool("read_file", {
     title: "Read file",
     description:
-      "Download a course file and extract its text (PDF, DOCX, PPTX with speaker notes, HTML, text/code). " +
-      "Long files come back in chunks; to keep reading, call again with the offset given at the end of the previous chunk.",
+      "Download a course file and read it: text from PDF, DOCX, PPTX (with speaker notes), HTML and text/code; PNG/JPG files come back as images. " +
+      "PDF pages with no text layer (scanned worksheets, answer keys, handwriting) are automatically returned as page images you can read, " +
+      `up to ${MAX_IMAGES} per call — use \`pages\` to get the rest. Set as_images=true to see pages as images even when they have text ` +
+      "(diagrams, graphs, tables, chemical structures). Long text comes back in chunks; continue with the offset given at the end.",
     inputSchema: {
       file_id: z.union([z.string(), z.number()]).transform(String),
-      offset: z.number().int().min(0).default(0).describe("Character offset to start reading from"),
+      course_id: courseId.optional().describe("The course the file belongs to (helps when the file is only reachable through the course)"),
+      pages: z.string().optional().describe('PDF only: pages to read, e.g. "3", "2-6", "1,4,7"'),
+      as_images: z.boolean().default(false).describe("PDF only: return the selected pages (default first 5) as images even if they contain text"),
+      offset: z.number().int().min(0).default(0).describe("Character offset for continuing long text"),
     },
     annotations: ro,
-  }, safe(async ({ file_id, offset }) => {
-    let doc = fileCache.get(file_id);
-    if (!doc) {
-      const meta = await canvas.get(`/files/${file_id}`);
-      if (!meta.url) throw new Error(`File "${meta.display_name}" is locked or has no download link${meta.lock_explanation ? `: ${htmlToText(meta.lock_explanation)}` : ""}`);
-      if (meta.size > 50 * 1024 * 1024) throw new Error(`File is ${Math.round(meta.size / 1048576)} MB; too large to read here.`);
-      const { bytes, contentType } = await canvas.download(meta.url);
-      const { text, kind } = await extractFileText(bytes, meta.display_name, meta["content-type"] || contentType);
-      doc = { name: meta.display_name, kind, text };
-      fileCache.set(file_id, doc);
-      if (fileCache.size > 30) fileCache.delete(fileCache.keys().next().value!);
+  }, async ({ file_id, course_id, pages, as_images, offset }) => {
+    try {
+      const doc = await loadFile(file_id, course_id);
+      if (doc.image) {
+        return { content: [
+          { type: "text" as const, text: `# ${doc.name} (image)` },
+          { type: "image" as const, data: doc.image.data, mimeType: doc.image.mime },
+        ] };
+      }
+
+      const content: ({ type: "text"; text: string } | { type: "image"; data: string; mimeType: string })[] = [];
+      if (!doc.pageTexts || !doc.pdf) {
+        const chunk = doc.text.slice(offset, offset + opts.maxChars);
+        const end = offset + chunk.length;
+        const more = end < doc.text.length ? `\n\n…[${doc.text.length - end} more characters — call read_file with offset=${end}]` : "";
+        return ok(`# ${doc.name} (${doc.kind}, chars ${offset}-${end} of ${doc.text.length})\n\n${chunk}${more}`);
+      }
+
+      // ----- PDF -----
+      const total = doc.pageTexts.length;
+      const selected = pages ? parsePages(pages, total) : [...Array(total).keys()].map((i) => i + 1);
+      if (!selected.length) throw new Error(`This PDF has ${total} pages; "${pages}" selects none of them.`);
+      const blank = selected.filter((n) => doc.pageTexts![n - 1].length < SCANNED_PAGE_CHARS);
+
+      let header: string;
+      if (pages) {
+        const body = selected.map((n) => `--- Page ${n} ---\n${doc.pageTexts![n - 1] || "[no text on this page — see image]"}`).join("\n\n");
+        header = `# ${doc.name} (${doc.kind}, pages ${pages})\n\n${truncate(body, opts.maxChars)}`;
+      } else {
+        const chunk = doc.text.slice(offset, offset + opts.maxChars);
+        const end = offset + chunk.length;
+        const more = end < doc.text.length ? `\n\n…[${doc.text.length - end} more characters — call read_file with offset=${end}]` : "";
+        header = `# ${doc.name} (${doc.kind}, chars ${offset}-${end} of ${doc.text.length})\n\n${chunk}${more}`;
+      }
+
+      // Images: only on the first chunk (or when pages are named), so continuing text doesn't resend them.
+      const wantImages = as_images ? selected : blank;
+      const send = offset > 0 && !pages ? [] : wantImages.slice(0, MAX_IMAGES);
+      const rest = wantImages.slice(send.length);
+      const notes: string[] = [];
+      if (blank.length === selected.length && !as_images) notes.push("This PDF is scanned (no text layer), so its pages are attached as images.");
+      if (send.length) {
+        const rendered = await renderPdfPages(doc.pdf, send);
+        if (!rendered) {
+          notes.push("Page images are unavailable: the @napi-rs/canvas package isn't installed on the server. Run `npm install` in the canvas-mcp folder.");
+        } else {
+          notes.push(`Attached page image${send.length > 1 ? "s" : ""}: ${send.join(", ")}.`);
+          for (const r of rendered) content.push({ type: "image", data: r.data, mimeType: "image/jpeg" });
+        }
+      }
+      if (rest.length) notes.push(`${rest.length} more page(s) to view as images: ${rest.join(", ")} — call read_file with pages="${rest.slice(0, MAX_IMAGES).join(",")}".`);
+      content.unshift({ type: "text", text: header + (notes.length ? `\n\n[${notes.join(" ")}]` : "") });
+      return { content };
+    } catch (e) {
+      return fail(e);
     }
-    const chunk = doc.text.slice(offset, offset + opts.maxChars);
-    const end = offset + chunk.length;
-    const more = end < doc.text.length ? `\n\n…[${doc.text.length - end} more characters — call read_file with offset=${end}]` : "";
-    return `# ${doc.name} (${doc.kind}, chars ${offset}-${end} of ${doc.text.length})\n\n${chunk}${more}`;
-  }));
+  });
 
   // ---------- Announcements & discussions ----------
   server.registerTool("list_announcements", {
@@ -286,6 +426,7 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
     return anns.map((a: any) => ({
       title: a.title, course_id: a.context_code?.replace("course_", ""), posted: fmt(a.posted_at), by: a.author?.display_name,
       message: htmlToText(a.message, 3000),
+      linked_files: linkedFiles(a.message).length ? linkedFiles(a.message) : undefined,
     }));
   }));
 
@@ -407,13 +548,18 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
       "by searching the names of modules, pages, files, and assignments. Use this to gather material before making a study guide.",
     inputSchema: { course_id: courseId, query: z.string().min(2) },
     annotations: ro,
-  }, safe(async ({ course_id, query }) => {
+  }, safe(({ course_id, query }) => searchCourse(course_id, query)));
+
+  async function searchCourse(course_id: string, query: string) {
     const q = query.toLowerCase();
     const hit = (s?: string) => !!s && s.toLowerCase().includes(q);
     const [mods, pages, files, assigns] = await Promise.all([
       canvas.getAll(`/courses/${course_id}/modules`, { include: ["items"] }).catch(() => []),
       canvas.getAll(`/courses/${course_id}/pages`, { search_term: query }).catch(() => []),
-      canvas.getAll(`/courses/${course_id}/files`, { search_term: query }, 2).catch(() => []),
+      canvas.getAll(`/courses/${course_id}/files`, { search_term: query }, 2).catch(async (e) =>
+        filesTabHidden(e)
+          ? (await discoverFiles(course_id)).filter((f) => f.name.toLowerCase().includes(query.toLowerCase())).map((f) => ({ id: f.id, display_name: f.name }))
+          : []),
       canvas.getAll(`/courses/${course_id}/assignments`, { search_term: query }).catch(() => []),
     ]);
     const moduleHits = mods.flatMap((m: any) =>
@@ -427,7 +573,76 @@ export function registerTools(server: McpServer, canvas: CanvasClient, opts: Too
       files: files.map((f: any) => ({ id: f.id, name: f.display_name })),
       assignments: assigns.map((a: any) => ({ id: a.id, name: a.name, due: fmt(a.due_at) })),
     };
-  }));
+  }
+
+  // ---------- ChatGPT connector contract ----------
+  // ChatGPT refuses to add an MCP server unless it has `search` and `fetch` tools with exactly this shape:
+  // search → {results:[{id,title,url}]}, fetch → {id,title,text,url,metadata}, each as JSON in one text item.
+  const json = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }] });
+  const link = (kind: string, course: string, key: string) =>
+    `${canvas.web}/courses/${course}/${{ page: "pages", file: "files", assignment: "assignments" }[kind]}/${encodeURIComponent(key)}`;
+
+  server.registerTool("search", {
+    title: "Search all courses",
+    description:
+      "Search pages, files and assignments across all of the student's active Canvas courses by title. " +
+      "Returns ids to open with fetch.",
+    inputSchema: { query: z.string().describe("Topic or title to look for, e.g. 'photosynthesis' or 'unit 3'") },
+    annotations: ro,
+  }, async ({ query }) => {
+    try {
+      const courses = await canvas.getAll("/courses", { enrollment_state: "active" });
+      const found = new Map<string, { id: string; title: string; url: string }>();
+      await Promise.all(courses.filter((c: any) => c.name).map(async (c: any) => {
+        const r = await searchCourse(String(c.id), query);
+        const add = (kind: string, key: unknown, title: string) => {
+          if (key === undefined || key === null) return;
+          const id = `${kind}:${c.id}:${key}`;
+          if (!found.has(id)) found.set(id, { id, title: `${title} (${c.name})`, url: link(kind, String(c.id), String(key)) });
+        };
+        for (const m of r.modules as any[]) for (const i of m.items ?? [m]) {
+          if (i.type === "Page") add("page", i.page_url, i.title);
+          else if (i.type === "File") add("file", i.content_id, i.title);
+          else if (i.type === "Assignment") add("assignment", i.content_id, i.title);
+        }
+        for (const p of r.pages) add("page", p.page_url, p.title);
+        for (const f of r.files) add("file", f.id, f.name);
+        for (const a of r.assignments) add("assignment", a.id, a.name);
+      }));
+      return json({ results: [...found.values()] });
+    } catch (e) {
+      return fail(e);
+    }
+  });
+
+  server.registerTool("fetch", {
+    title: "Open a search result",
+    description: "Read the full text of a page, file or assignment by the id that search returned.",
+    inputSchema: { id: z.string().describe("An id from search, e.g. page:123:unit-3-notes") },
+    annotations: ro,
+  }, async ({ id }) => {
+    try {
+      const [kind, course, ...rest] = id.split(":");
+      const key = rest.join(":");
+      if (!course || !key) throw new Error(`Unknown id "${id}". Use an id returned by search.`);
+      let title: string, text: string;
+      if (kind === "page") ({ title, text } = await readPage(course, key));
+      else if (kind === "assignment") {
+        const a = await getAssignment(course, key);
+        title = a.name;
+        text = JSON.stringify(a, null, 1);
+      } else if (kind === "file") {
+        const doc = await loadFile(key, course);
+        title = doc.name;
+        text = doc.text.trim()
+          ? truncate(doc.text, opts.maxChars)
+          : "(This file is an image or a scanned PDF with no text layer. Open it in Canvas to view it.)";
+      } else throw new Error(`Unknown id "${id}". Use an id returned by search.`);
+      return json({ id, title, text, url: link(kind, course, key), metadata: { type: kind, course_id: course } });
+    } catch (e) {
+      return fail(e);
+    }
+  });
 }
 
 // ---------- Prompts (show up as slash-commands / templates in Claude clients) ----------

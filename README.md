@@ -15,12 +15,13 @@ It can't submit, post, or change anything in Canvas. Every tool only reads.
 | `get_syllabus` | Syllabus text |
 | `list_modules` | Units/weeks and their contents. Usually the best map of a course. |
 | `list_pages` / `get_page` | Notes and pages the teacher wrote in Canvas |
-| `list_files` / `read_file` | Reads **PDF, DOCX, PPTX (with speaker notes), HTML, text/code**. Long files come back in chunks. |
+| `list_files` / `read_file` | Reads **PDF, DOCX, PPTX (with speaker notes), HTML, text/code**; scanned PDF pages and PNG/JPG files come back as **images** Claude can read (handwritten keys included). Still finds files when the teacher hides the Files tab. |
 | `list_announcements` | Recent announcements ("test moved to Tuesday") |
 | `get_calendar` | Course calendar for any date range: daily lesson topics, test days, and optionally due dates ("what did we do Tuesday?", "what's been covered since the last test?") |
 | `list_discussions` / `get_discussion` | Discussion prompts and replies |
 | `list_quizzes` | Quiz/test dates, number of questions, time limits |
 | `search_course` | Finds modules, pages, files, and assignments matching a topic |
+| `search` / `fetch` | Search across all courses and read a result. These exist for ChatGPT, which requires these two tools. |
 
 Prompts (they show up as templates or slash commands in clients that support them): **`study_guide`**, **`quiz_me`**, **`weekly_plan`**.
 
@@ -97,6 +98,12 @@ HTTP mode serves MCP at `https://your-host/mcp/<MCP_SECRET>`. claude.ai's server
 
 Without Docker: `node dist/index.js --http` (it reads the same env vars). It binds to 127.0.0.1 by default, so only this machine can reach it; add `--host 0.0.0.0` when a proxy on another machine needs to reach it.
 
+### Option D: ChatGPT
+
+ChatGPT only connects to servers on the internet, so first host it as in Option C. Then in ChatGPT go to Settings → Apps & Connectors → Create (turn on Developer mode under Advanced if you don't see Create), paste the same `https://canvas-mcp.yourdomain.com/mcp/<MCP_SECRET>` URL, and pick **No authentication**.
+
+Without Developer mode, ChatGPT only uses the `search` and `fetch` tools (search pages, files and assignments across all your courses, then read one). With Developer mode on, it can use every tool.
+
 > ⚠️ Anyone who has the full URL can read your Canvas through it. Treat the URL like a password. If it leaks, change `MCP_SECRET`, and also revoke the token in Canvas if you're unsure.
 
 ---
@@ -132,9 +139,9 @@ canvas-mcp --help | --version
 
 ## Limitations
 
-- **Scanned PDFs** (images with no text layer) come back mostly empty, and the tool says so. Download the file and attach it to the chat so Claude can see the pages.
+- **Scanned PDFs** come back as page images, 5 per call (Claude asks for the rest with `pages`). Rendering uses the full pdf.js build with its JBIG2 decoder, because school copier scans store the text in a JBIG2 layer that lighter PDF libraries silently drop.
 - **Quiz questions** aren't visible to students through the API until results are released. That's Canvas's rule, not something this server can change.
-- Some schools hide tabs such as Files or Pages. Those tools return a 403/404, and Claude can work around it with `list_modules`.
+- If a teacher hides the **Files** tab, `list_files` falls back to every file linked from modules, assignments, pages, the syllabus and announcements. Other hidden tabs return 403/404, and Claude works around them with `list_modules`.
 - Some schools disable personal access tokens entirely. If you can't make one, this approach won't work at your school.
 
 ## Development

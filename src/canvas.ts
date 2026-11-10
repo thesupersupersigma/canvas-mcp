@@ -16,8 +16,11 @@ type Params = Record<string, string | number | boolean | (string | number)[] | u
 
 export class CanvasClient {
   private api: string;
+  /** Web address of the Canvas site, e.g. https://myschool.instructure.com */
+  readonly web: string;
   constructor(private cfg: CanvasConfig) {
-    this.api = cfg.baseUrl.replace(/\/+$/, "").replace(/\/api\/v1$/, "") + "/api/v1";
+    this.web = cfg.baseUrl.replace(/\/+$/, "").replace(/\/api\/v1$/, "");
+    this.api = this.web + "/api/v1";
   }
 
   private buildUrl(path: string, params: Params = {}): string {
