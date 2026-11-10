@@ -1,9 +1,11 @@
 // Minimal Canvas LMS REST client: auth, pagination, error handling.
 
 export interface CanvasConfig {
-  baseUrl: string; // e.g. https://myschool.instructure.com
+  baseUrl: string; // e.g. https://yourschool.instructure.com
   token: string;
   maxPages?: number;
+  fetch?: typeof fetch; // defaults to globalThis.fetch
+  maxJsonBytes?: number; // largest API (JSON) response read, in bytes; default no limit. File downloads aren't affected.
 }
 
 export class CanvasError extends Error {
@@ -16,7 +18,7 @@ type Params = Record<string, string | number | boolean | (string | number)[] | u
 
 export class CanvasClient {
   private api: string;
-  /** Web address of the Canvas site, e.g. https://myschool.instructure.com */
+  /** Web address of the Canvas site, e.g. https://yourschool.instructure.com */
   readonly web: string;
   constructor(private cfg: CanvasConfig) {
     this.web = cfg.baseUrl.replace(/\/+$/, "").replace(/\/api\/v1$/, "");
@@ -34,7 +36,7 @@ export class CanvasClient {
   }
 
   private async raw(url: string): Promise<Response> {
-    const res = await fetch(url, {
+    const res = await (this.cfg.fetch ?? fetch)(url, {
       headers: { Authorization: `Bearer ${this.cfg.token}`, Accept: "application/json+canvas-string-ids, application/json" },
     });
     if (!res.ok) {
@@ -49,9 +51,26 @@ export class CanvasClient {
     return res;
   }
 
+  /** The body as JSON; past maxJsonBytes, an error instead, and the rest is never read. */
+  private async json(res: Response): Promise<any> {
+    const max = this.cfg.maxJsonBytes;
+    if (max === undefined || !res.body) return res.json();
+    const reader = res.body.getReader(), chunks: Uint8Array[] = [];
+    for (let size = 0; ;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if ((size += value.byteLength) > max) {
+        reader.cancel().catch(() => {});
+        throw new Error(`Canvas sent more than ${max / 1048576} MB in one response; try a narrower request.`);
+      }
+      chunks.push(value);
+    }
+    return JSON.parse(new TextDecoder().decode(Buffer.concat(chunks)));
+  }
+
   async get<T = any>(path: string, params: Params = {}): Promise<T> {
     const res = await this.raw(this.buildUrl(path, params));
-    return (await res.json()) as T;
+    return (await this.json(res)) as T;
   }
 
   /** Follows Link: rel="next" headers until exhausted or maxPages hit. */
@@ -60,7 +79,7 @@ export class CanvasClient {
     const out: T[] = [];
     for (let page = 0; url && page < maxPages; page++) {
       const res = await this.raw(url);
-      const data = await res.json();
+      const data = await this.json(res);
       if (Array.isArray(data)) out.push(...data);
       else return [data as T];
       url = parseNext(res.headers.get("link"));
@@ -71,7 +90,7 @@ export class CanvasClient {
   /** Downloads a file (Canvas file URLs redirect to signed S3/CDN links). */
   async download(url: string): Promise<{ bytes: Uint8Array; contentType: string }> {
     // Signed download URLs don't need the bearer token, but Canvas-hosted ones do.
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${this.cfg.token}` }, redirect: "follow" });
+    const res = await (this.cfg.fetch ?? fetch)(url, { headers: { Authorization: `Bearer ${this.cfg.token}` }, redirect: "follow" });
     if (!res.ok) throw new CanvasError(res.status, `File download failed: ${res.status}`);
     return { bytes: new Uint8Array(await res.arrayBuffer()), contentType: res.headers.get("content-type") ?? "" };
   }

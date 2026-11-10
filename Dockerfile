@@ -13,5 +13,5 @@ COPY --from=build /app/dist ./dist
 COPY package.json ./
 USER node
 EXPOSE 7341
-HEALTHCHECK CMD wget -qO- http://127.0.0.1:7341/health || exit 1
+HEALTHCHECK CMD wget -qO- "http://127.0.0.1:${CANVAS_MCP_PORT:-7341}/health" || exit 1
 CMD ["node", "dist/index.js", "--http"]
